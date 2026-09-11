@@ -1,0 +1,11 @@
+# Reference implementations are kept locally for study only.
+references/
+reference/
+
+# Common local/editor artifacts
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.pyc
+__pycache__/
