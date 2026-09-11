@@ -1,0 +1,1 @@
+CREATE ROLE research_app LOGIN PASSWORD 'research_local' NOSUPERUSER NOBYPASSRLS;

@@ -1,0 +1,22 @@
+[
+ {"id":"dev-tech-01","brief":{"question":"为中文技术知识库比较关键词、向量和混合检索，保留错误码精确匹配，并讨论重排成本。","template":"technical_comparison","constraints":["准确匹配 ERR_AUTH_42","不要跨硬件直接比较延迟"]},"rubric":["identifier matching","hybrid tradeoffs","incomparable measurements"]},
+ {"id":"dev-tech-02","brief":{"question":"为中小团队比较 PostgreSQL pgvector 与独立向量数据库的运维、过滤和检索能力。","template":"technical_comparison","constraints":["明确产品版本和部署假设"]},"rubric":["versioned evidence","operations","filter behavior","unknown costs"]},
+ {"id":"dev-tech-03","brief":{"question":"比较知识库检索的 BM25、dense retrieval 和 late interaction 方法，解释适用条件。","template":"technical_comparison"},"rubric":["principles","retrieval stages","conditional recommendation"]},
+ {"id":"dev-tech-04","brief":{"question":"比较 cross-encoder 重排与双塔向量排序，分析候选数量、成本和评价口径。","template":"technical_comparison"},"rubric":["candidate budget","recall versus ranking","latency attribution"]},
+ {"id":"dev-tech-05","brief":{"question":"比较长技术文档按固定长度、结构段落和语义边界切分对检索的影响。","template":"technical_comparison","constraints":["保留章节层次与否定限定条件"]},"rubric":["boundary loss","source examples","tradeoffs"]},
+ {"id":"dev-tech-06","brief":{"question":"比较查询改写、查询扩展和保持原始查询的检索流程，重点考虑错误码与罕见术语。","template":"technical_comparison"},"rubric":["query drift","exact match retention","failure cases"]},
+ {"id":"dev-tech-07","brief":{"question":"比较文档更新后全量重建与增量索引的知识库方案，说明一致性和运维约束。","template":"technical_comparison"},"rubric":["freshness","deletion behavior","operational constraints"]},
+ {"id":"dev-tech-08","brief":{"question":"比较结构化过滤先于向量检索与检索后过滤，解释召回损失及适用条件。","template":"technical_comparison"},"rubric":["filter semantics","selectivity","evidence limitations"]},
+ {"id":"dev-tech-09","brief":{"question":"比较 RRF 与加权分数融合的混合检索，说明分数可比性和需要调优的参数。","template":"technical_comparison"},"rubric":["ranking versus score","calibration","parameter assumptions"]},
+ {"id":"dev-tech-10","brief":{"question":"比较托管检索服务与自建知识库检索，在敏感技术文档和预算约束下给出决策条件。","template":"technical_comparison"},"rubric":["data boundaries","cost components","no invented pricing"]},
+ {"id":"dev-tech-11","brief":{"question":"比较单次检索 RAG 与迭代检索 Agent，重点分析证据遗漏、延迟和工具调用成本。","template":"technical_comparison"},"rubric":["bounded iteration","failure recovery","measured versus claimed"]},
+ {"id":"dev-tech-12","brief":{"question":"比较用原始长文、摘要和精选证据片段构造研究上下文的方法，分析信息保留与成本。","template":"technical_comparison"},"rubric":["constraint retention","recoverability","cache versus compression"]},
+ {"id":"dev-paper-01","brief":{"question":"研读提供的检索论文，解释方法原理、实现流程、实验设置、局限和可检验的后续研究方向。","template":"paper_review"},"rubric":["problem and contribution","implementation fidelity","experimental controls","actionable hypothesis"]},
+ {"id":"dev-paper-02","brief":{"question":"研读论文正文与附录，解释消融实验如何支持模块贡献，并指出缺少的对照实验。","template":"paper_review"},"rubric":["appendix evidence","ablation attribution","missing controls","novelty unverified"]},
+ {"id":"dev-paper-03","brief":{"question":"研读实验报告，解释数据划分、评价指标和 baseline，判断结论的适用范围并提出研究建议。","template":"paper_review"},"rubric":["dataset split","metrics","baseline comparability","claim limitations"]},
+ {"id":"dev-paper-04","brief":{"question":"为首次接触该研究方向的工程师讲解提供的论文，区分作者陈述、解释性推断和研究假设。","template":"paper_review"},"rubric":["clarity","principle fidelity","attribution","no reproduction claim"]},
+ {"id":"dev-general-01","brief":{"question":"研究技术知识库中错误码检索失败的常见原因，给出有证据的分类和待验证问题。","template":"general_research"},"rubric":["failure taxonomy","source support","uncertainty"]},
+ {"id":"dev-general-02","brief":{"question":"研究如何评价一个多轮信息检索 Agent，分别讨论研究质量、成本和运行可靠性。","template":"general_research"},"rubric":["separate metrics","fair baseline","reproducibility"]},
+ {"id":"dev-general-03","brief":{"question":"研究公开技术基准中影响性能结论可比性的因素，形成阅读实验报告的检查框架。","template":"general_research"},"rubric":["hardware","dataset","metric definitions","versioning"]},
+ {"id":"dev-general-04","brief":{"question":"研究长文档摘要如何遗漏关键否定条件和实验局限，说明可观察的诊断与验证方法。","template":"general_research"},"rubric":["negation retention","source rereading","testable diagnostics"]}
+]

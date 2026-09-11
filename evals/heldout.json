@@ -1,0 +1,12 @@
+[
+ {"id":"heldout-tech-01","brief":{"question":"为同时含英文 API 名称和中文故障说明的知识库比较检索方案，限制每次查询的重排候选数。","template":"technical_comparison"},"rubric":["multilingual terms","candidate bound","conditional recommendation"]},
+ {"id":"heldout-tech-02","brief":{"question":"比较知识库检索中的 parent-child chunks 与直接段落检索，分析上下文缺失和成本。","template":"technical_comparison"},"rubric":["context reconstruction","storage tradeoff","evidence limits"]},
+ {"id":"heldout-tech-03","brief":{"question":"比较针对频繁更新技术资料的稀疏和稠密索引方案，重点讨论删除和版本一致性。","template":"technical_comparison"},"rubric":["version consistency","delete semantics","update cost"]},
+ {"id":"heldout-tech-04","brief":{"question":"比较带权限过滤的混合检索流程，分析过滤次序、可见范围与结果数量之间的关系。","template":"technical_comparison"},"rubric":["authorization","filter order","result shortfall"]},
+ {"id":"heldout-tech-05","brief":{"question":"比较为长论文检索使用局部段落、章节摘要和完整文档的方案，保留跨章节实验限定。","template":"technical_comparison"},"rubric":["cross-section constraints","source precision","cost"]},
+ {"id":"heldout-tech-06","brief":{"question":"比较检索后一次性生成报告与审查后补证的研究流程，说明何时增加检索没有价值。","template":"technical_comparison"},"rubric":["gap criteria","stopping condition","fair comparison"]},
+ {"id":"heldout-paper-01","brief":{"question":"解释提供论文的核心模块和附录实验，指出结论对数据分布的依赖并提出一个可检验的扩展。","template":"paper_review"},"rubric":["module explanation","appendix","distribution assumptions","minimal experiment"]},
+ {"id":"heldout-paper-02","brief":{"question":"研读两个实验设置不完全相同的报告，讲清方法和实验设计，避免直接宣称一方更优。","template":"paper_review"},"rubric":["method clarity","non-comparability","author versus inference","future controls"]},
+ {"id":"heldout-general-01","brief":{"question":"研究如何定位检索 Agent 在多轮调用后漏掉用户约束的问题，给出观察点与实验设计。","template":"general_research"},"rubric":["failure localization","persistent constraints","test design"]},
+ {"id":"heldout-general-02","brief":{"question":"研究公开技术资料互相矛盾时如何形成有条件的工程判断，并保留不确定性与反证。","template":"general_research"},"rubric":["conflict attribution","independent sources","conditional conclusion"]}
+]

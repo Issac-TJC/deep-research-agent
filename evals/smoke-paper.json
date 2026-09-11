@@ -1,0 +1,22 @@
+{
+  "brief": {
+    "question": "研读这篇 Reciprocal Rank Fusion 论文，解释它试图解决的问题、融合公式和实现流程、实验比较方式与结果的适用边界，总结局限，并提出一条可以验证的后续研究假设。",
+    "template": "paper_review",
+    "constraints": [
+      "只研读给定论文；不补充外部文献，不执行代码、不声称复现实验。",
+      "讲清原理和实验设计；区分作者陈述、系统推断和待验证假设。",
+      "没有报告的实验细节明确标为未知；引用必须定位到本文原文。"
+    ],
+    "source_urls": ["https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf"]
+  },
+  "profile": {
+    "max_usd": 0.5,
+    "max_tasks": 2,
+    "max_gap_rounds": 0,
+    "max_patch_rounds": 1,
+    "max_search_calls": 0,
+    "max_task_search_calls": 0,
+    "paper_related_sources": 0,
+    "max_task_tools": 4
+  }
+}
