@@ -1,0 +1,21 @@
+name: local-contracts
+on: [push, pull_request]
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with: {version: '0.12.13'}
+      - run: uv sync --extra dev --frozen
+      - run: uv run --extra dev ruff check src migrations tests
+      - run: docker compose up -d --wait postgres minio
+      - run: uv run --extra dev research migrate
+      - run: uv run --extra dev pytest -q
+        env: {RUN_INTEGRATION: '1'}
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - run: corepack enable
+      - run: pnpm install --frozen-lockfile && pnpm build
+        working-directory: apps/web
+        env: {NEXT_TELEMETRY_DISABLED: '1'}
