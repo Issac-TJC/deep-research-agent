@@ -6,6 +6,10 @@ x-app-env: &app-env
   S3_SECRET_KEY: research_minio_local_secret
   S3_BUCKET: research-artifacts
   PARSER_URL: http://parser:8001
+  EMBEDDING_URL: http://embedding:8002
+  EMBEDDING_MODEL: Alibaba-NLP/gte-multilingual-base
+  EMBEDDING_REVISION: 9bbca17
+  RETRIEVAL_SHADOW: ${RETRIEVAL_SHADOW:-false}
   RESEARCH_MODE: ${RESEARCH_MODE:-live}
   DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
   DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
@@ -21,7 +25,7 @@ x-app-env: &app-env
   REQUEST_TIMEOUT: ${REQUEST_TIMEOUT:-90}
 services:
   postgres:
-    image: postgres:17.6-alpine
+    image: pgvector/pgvector:0.8.6-pg17
     environment:
       POSTGRES_DB: research
       POSTGRES_USER: postgres
@@ -50,34 +54,71 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
   parser:
-    build: {context: ., dockerfile: infra/docker/Dockerfile}
+    build: {context: ., dockerfile: infra/docker/Dockerfile.parser}
     command: uvicorn research_agent.parser_service:app --host 0.0.0.0 --port 8001
+    environment:
+      DOCLING_ARTIFACTS_PATH: /home/research/.cache/docling/models
+      HF_HOME: /models/huggingface
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      OMP_NUM_THREADS: 4
     networks: [parse]
     read_only: true
-    tmpfs: ["/tmp:size=64m"]
-    mem_limit: 1g
-    cpus: 1
-    pids_limit: 64
+    tmpfs: ["/tmp:size=1g"]
+    mem_limit: 6g
+    cpus: 4
+    pids_limit: 256
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+  embedding:
+    build: {context: ., dockerfile: infra/docker/Dockerfile.embedding}
+    command: uvicorn research_agent.embedding_service:app --host 0.0.0.0 --port 8002
+    environment:
+      EMBEDDING_MODEL_PATH: /models/gte-multilingual-base
+      EMBEDDING_THREADS: 4
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+      HF_HOME: /models/huggingface
+      HF_MODULES_CACHE: /tmp/hf_modules
+      SENTENCE_TRANSFORMERS_HOME: /tmp/st_cache
+    networks: [models]
+    read_only: true
+    tmpfs: ["/tmp:size=256m"]
+    mem_limit: 4g
+    cpus: 4
+    pids_limit: 256
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
   api:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     environment: *app-env
-    networks: [default, parse]
+    networks: [default, parse, models]
     ports: ["127.0.0.1:18000:8000"]
     depends_on:
       migrate: {condition: service_completed_successfully}
       minio: {condition: service_started}
       parser: {condition: service_started}
+      embedding: {condition: service_started}
   worker:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     command: research worker
     environment: *app-env
-    networks: [default, parse]
+    networks: [default, parse, models]
     depends_on:
       migrate: {condition: service_completed_successfully}
       minio: {condition: service_started}
       parser: {condition: service_started}
+      embedding: {condition: service_started}
+  indexer:
+    build: {context: ., dockerfile: infra/docker/Dockerfile}
+    command: research indexer
+    environment: *app-env
+    networks: [default, parse, models]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_started}
+      parser: {condition: service_started}
+      embedding: {condition: service_started}
   web:
     build: {context: ./apps/web}
     environment:
@@ -89,4 +130,6 @@ volumes:
   objects:
 networks:
   parse:
+    internal: true
+  models:
     internal: true

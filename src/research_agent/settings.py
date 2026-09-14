@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     live_campaign_usd: float = 10.0
     api_origin: str = "http://localhost:18000"
     parser_url: str | None = None
+    embedding_url: str | None = None
+    embedding_model: str = "Alibaba-NLP/gte-multilingual-base"
+    embedding_revision: str = "9bbca17"
+    embedding_dimensions: int = 768
+    index_lease_seconds: int = 180
+    index_poll_seconds: float = 0.5
+    index_wait_seconds: int = 30
+    retrieval_shadow: bool = False
     lease_seconds: int = 45
     heartbeat_seconds: int = 10
     max_upload_bytes: int = 20 * 1024 * 1024
@@ -50,6 +58,9 @@ class Settings(BaseSettings):
             "model_cache_usd_per_million",
             "search_usd_per_call",
             "request_timeout",
+            "embedding_model",
+            "embedding_revision",
+            "retrieval_shadow",
         ]
         return {
             "runtime_fingerprint": RUNTIME_FINGERPRINT,

@@ -336,6 +336,15 @@ small {
   background: #f3f7ef;
   margin-right: 7px;
 }
+.chip.support {
+  color: #6a5b28;
+  background: #f6f0dc;
+}
+.dependency {
+  display: block;
+  margin-top: 7px;
+  color: #805f20;
+}
 .chip button {
   border: 0;
   padding: 0 3px;
@@ -405,6 +414,67 @@ small {
   grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
   margin: 20px 0 25px;
+}
+.intent-board {
+  margin: 20px 0;
+  padding: 22px;
+  border-left: 4px solid var(--green);
+}
+.intent-board h3 {
+  margin: 4px 0 16px;
+  font-family: Georgia, "Songti SC", serif;
+  font-size: 19px;
+}
+.intent-stages {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+}
+.intent-stages article {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fafcf7;
+}
+.intent-stages strong {
+  display: block;
+  margin-top: 10px;
+}
+.intent-stages p {
+  color: var(--muted);
+  margin: 5px 0;
+}
+.capability-gap {
+  margin: 14px 0 0;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: #fff4d9;
+  color: #8b6512;
+}
+.node-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 5px;
+}
+.structured-block {
+  margin: 22px 0;
+  padding: 20px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  background: #fafcf7;
+}
+.structured-block > div {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 10px;
+  margin-top: 10px;
+}
+.structured-block > div h3,
+.structured-block > div p {
+  margin: 0;
 }
 .tasks article {
   border: 1px solid var(--line);
@@ -746,4 +816,13 @@ th {
     align-items: start;
     gap: 10px;
   }
+}
+.evidence-crop {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+  margin: 12px 0;
+  border: 1px solid var(--line);
+  background: #fff;
 }

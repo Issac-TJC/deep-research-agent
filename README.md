@@ -4,7 +4,9 @@
 
 项目重点是 Agent 应用工程：如何在多个模型调用、工具失败、预算限制和进程中断下交付一份可检查的研究包。它不是搜索结果的拼接器，也没有自动执行论文代码。
 
-**当前状态：V1 工程闭环已实现，真实 API 联调已接通。** 四角色协作、证据版本、持久化恢复、调用预算、两租户隔离、工作台和评测入口均可运行。真实研究仍会产生 `needs_review` 报告；准确率、多 Agent 收益和大规模保留集质量实验尚未完成。本次验证包含 45 项后端测试、2 项真实浏览器测试及 24 次合成流程评测。实现与实测边界见 [验证结果](docs/verification-results.md)。
+**当前状态：V1 工程闭环已实现，真实 API 联调已接通。** 四角色协作、证据版本、持久化恢复、调用预算、两租户隔离、工作台和评测入口均可运行。真实研究仍会产生 `needs_review` 报告；准确率、多 Agent 收益和大规模保留集质量实验尚未完成。后端单元／集成测试、真实浏览器测试及合成流程评测均保留为可重复入口。实现与实测边界见 [验证结果](docs/verification-results.md)。
+
+仓库正在向 V2 的“论文工作编排器”演进：自由输入会先编译为 `ResearchIntent`，再按 Introduction、Related Work、Method、Experiment 等模块选择方法和交付物；模块区分最终交付与内部支撑，并通过依赖 DAG 协作。设计边界与迁移顺序见 [Research Agent V2 设计](docs/research-agent-v2-design.md)。旧模板字段暂时保留用于 API 和历史运行兼容。
 
 ## 1. 能做什么
 
@@ -18,7 +20,7 @@
 
 论文研读区分**作者陈述、系统推断和待验证假设**。研究建议包含动机、假设、实验、基线、指标、预期信号和失败风险；新颖性标为未验证，实验状态为 `not_executed`。默认最多补充 3 个非种子来源。论文中的实验数字是作者报告值，不能当作本项目复现结果。
 
-输入支持公开 HTML、文本型 PDF、Markdown 和上传文件。输出研究包包含报告 AST／Markdown、Claim、EvidenceSpan、SourceVersion、配置与来源哈希、质量状态及未解决项。工作台能查看计划、任务、来源原文、PDF 页、引用片段、研究建议、事件和费用。
+输入支持公开 HTML、Markdown、文本型或扫描型 PDF 和上传文件。PDF 默认异步使用本地 Docling + RapidOCR 增强解析，超时会返回可轮询的 upload ID；失败时回退 pdfplumber。输出研究包包含报告 AST／Markdown、Claim、EvidenceSpan、SourceVersion、配置与来源哈希、质量状态及未解决项。工作台能查看计划、任务、来源原文、PDF 页、引用片段、解析／索引状态、研究建议、事件和费用。
 
 ## 2. 架构与执行流程
 
@@ -31,9 +33,11 @@ flowchart TD
     DB --> W[单进程 LangGraph Worker]
     W --> P[Planner：问题与任务 DAG]
     P --> R[Researcher：独立子图，最多 3 路并发]
-    R --> T[Search / Fetch / Read]
+    R --> T[Search / Fetch / Search Sources / Read]
     T --> E[受限解析 → 原文与证据工件]
     E --> OBJ[(MinIO)]
+    E --> IDX[Indexer：CJK 词法分块 + 本地 embedding]
+    IDX --> DB
     R --> V[Reviewer + 程序检查]
     V -->|需要补证，额度允许| R
     V --> WR[Writer：结构化报告]
@@ -49,7 +53,7 @@ flowchart TD
 | 组件 | 实现与边界 | 主要代码 |
 |---|---|---|
 | Planner | 生成结构化问题、任务与依赖；Pydantic 验证 DAG、数量和字段 | `graph.py`、`contracts.py` |
-| Researcher | 每任务独立状态与消息，执行有界 `search`、`fetch`、`read_source` 循环，再抽取 claim | `graph.py` |
+| Researcher | 每任务独立状态与消息，先在授权来源内混合检索，再执行有界 `search`、`fetch`、`search_sources`、`read_source` 循环并抽取 claim | `graph.py`、`retrieval.py` |
 | Reviewer | 检查支持关系、覆盖、冲突、来源独立性及论文解释；输出补证任务或报告修改位置 | `graph.py` |
 | Writer | 用已接受证据写 AST；局部修订只能替换授权节点，保留其他稳定 ID | `graph.py`、`evidence.py` |
 | ModelProvider / Gateway | DeepSeek 适配、协议字段保留、schema 校验、有限重试、调用计量与预留 | `providers.py`、`gateway.py` |
@@ -75,13 +79,14 @@ flowchart TD
 | 模型上下文 | 固定 brief／用户约束、角色任务、任务状态、精选证据、必要工具历史 | 每次请求重新装配；模型只能看到当次被选入的内容 |
 | 持久化研究记忆 | 原文、解析版本、claim／span、finding、报告版本、上下文快照、调用账本和事件 | PostgreSQL + MinIO；运行结束后保留，可审计、回读和导出 |
 | 跨 run 资料复用 | 同租户上传／来源 ID，可在新 brief 的 `upload_ids` 中显式引用 | 显式复用原文资料；不自动把旧报告结论当成新证据 |
-| 长期语义记忆 | **尚未实现**自动跨会话向量检索、用户画像、记忆更新／遗忘／冲突合并 | 后续扩展项；不能仅因使用数据库就声称已有完整长期记忆 |
+| 文档语义检索 | PostgreSQL FTS + pgvector；CJK 双字 token、精确标识符、768 维本地 embedding、RRF 与重叠去重 | 同租户、当前任务授权来源内发现段落；检索 hit 不是证据 |
+| 长期 Agent 记忆 | **尚未实现**用户画像、自动跨 run 记忆写回、遗忘与冲突合并 | 本项目的文档检索不等于 Mem0／Letta 一类长期记忆 |
 
 ### 上下文怎样控制
 
 1. 完整原文保存到对象存储，不反复塞进全部 Agent 消息。
 2. 固定 brief、用户约束和任务目标优先保留；Planner／Reviewer／Writer 使用不同的证据输入。
-3. Researcher 可按 source ID 和字符范围回读原文；工具轮次必须完整配对，保留供应商所需的 reasoning／tool-call 协议字段。
+3. Researcher 在最多 24 个任务授权来源中先做词法／向量混合检索，再按 source ID 和字符范围回读命中前后原文；检索结果明确标记 `evidence=false`，不能直接生成 Claim。
 4. claim 与其 span 成组进入可选工件，避免主张和引用分离；未选入审查请求的主张不得被接受。`evidence` 策略选入证据工件；`full` 策略按稳定顺序尝试装入完整来源，两者受相同输入上限约束。省略记录在 `ContextSnapshot`，原工件仍保留。
 5. 大小检查使用 **UTF-8 字节保守上界**，不是供应商 tokenizer。默认请求上界 64k，并为 system、schema 与序列化预留空间。固定内容本身超限时明确停止并保留部分结果。
 
@@ -110,7 +115,7 @@ SourceVersion（原文字节哈希、解析版本、私有对象 key、来源地
 
 **可定位不等于逻辑支持。** 一段真实原文可能并不支持 claim 的附加从句；数字存在也不代表实验条件一致。自动门禁不是事实认证，界面保留 `needs_review` 和人工核验入口。
 
-PDF 解析目前使用 text-flow 顺序并调整字距容差。真实两栏论文曾出现错序和词间空格丢失，开发日志记录了修复；扫描件、复杂公式／图表和任意多栏版式仍可能失败，不提供 OCR 或论文代码执行。
+PDF 的 `auto` 模式优先使用完全本地的 Docling、RapidOCR、TableFormer、公式 enrichment 和 SmolVLM 图片描述，并保存 extraction method、置信度、页码、bbox 与视觉 crop；模型生成的图片描述只按 `system_inferred` 使用。增强解析不可用时回退 pdfplumber 并明确标记。解析能力仍不等于论文代码执行，低置信度 OCR／公式引用必须人工视觉确认。
 
 ## 5. 可靠性、预算和隔离
 
@@ -189,7 +194,7 @@ chmod 600 .local/test-tenants.jsonl
 | API / OpenAPI | http://localhost:18000 / http://localhost:18000/docs |
 | PostgreSQL | localhost:15432 |
 | MinIO API / Console | http://localhost:19000 / http://localhost:19001 |
-| Parser | 只在 Compose 内部网络访问 |
+| Parser / Embedding | 只在 Compose 内部网络访问 |
 
 Compose 自动先执行迁移。数据库和对象存储使用 `research-agent-v1` 专属命名卷；`docker compose down` 保留数据，`down -v` 会删除本项目卷。默认数据库／MinIO 凭证只用于回环地址上的本地开发，不应原样暴露到公网。
 
@@ -416,4 +421,3 @@ docs/                蓝图、开发日志、验证记录、运行手册、面�
 | [OpenResearch](https://github.com/alphaXiv/OpenResearch/tree/3736d7e03842f572be417d2e4de79ed5b06ef012) | Agent 工作区、实验树、运行与工件管理 | 原蓝图保留的历史分析与固定版本链接 |
 
 本次检查的 HelloAgents 与 DeerFlow 位于工作区相邻的 `../reference repo/`，未纳入本仓库。仓库内不存在 `references/hyperresearch/` 或 `references/OpenResearch/`；独立克隆本仓库时请使用上表固定版本链接。详细来源与代码边界见蓝图第 2 节和 Sources。
-

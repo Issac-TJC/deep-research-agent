@@ -20,7 +20,10 @@ from research_agent.contracts import (
     ReportPatch,
     ResearchBrief,
     ResearchFinding,
+    ResearchIntent,
+    ResearchMethod,
     ResearchPackage,
+    ResearchStage,
     ResearchTask,
     Review,
     ReviewFinding,
@@ -58,7 +61,18 @@ class ReadArgs(BaseModel):
     length: int = Field(default=6000, ge=100, le=12000)
 
 
-TOOL_MODELS = {"search": SearchArgs, "fetch": FetchArgs, "read_source": ReadArgs}
+class SearchSourcesArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=2, max_length=1000)
+    limit: int = Field(default=8, ge=1, le=12)
+
+
+TOOL_MODELS = {
+    "search": SearchArgs,
+    "fetch": FetchArgs,
+    "search_sources": SearchSourcesArgs,
+    "read_source": ReadArgs,
+}
 TOOLS = [
     {
         "type": "function",
@@ -72,6 +86,11 @@ TOOLS = [
             "Fetch and persist a public HTML/PDF/Markdown source; returns an authorized source id.",
         ),
         (
+            "search_sources",
+            SearchSourcesArgs,
+            "Find relevant ranges in authorized persisted sources. Results are leads, not evidence; read each range.",
+        ),
+        (
             "read_source",
             ReadArgs,
             "Read a bounded range of an authorized original source; follow up to read more.",
@@ -79,9 +98,41 @@ TOOLS = [
     ]
 ]
 
+STAGE_AGENT_INSTRUCTIONS = {
+    ResearchStage.INTRODUCTION: (
+        "Act as an Introduction research agent. Establish the field context and find evidence for a precise gap. "
+        "Connect the gap to a concrete objective, rationale, significance and falsifiable hypotheses."
+    ),
+    ResearchStage.RELATED_WORK: (
+        "Act as a Related Work research agent. Find primary work, build a defensible taxonomy, compare assumptions, "
+        "methods and evaluation conditions, and preserve disagreements and limitations."
+    ),
+    ResearchStage.METHODOLOGY: (
+        "Act as a Method research agent. Identify relevant baselines and mechanisms, then test whether each proposed "
+        "design choice addresses an evidenced limitation and record its failure modes."
+    ),
+    ResearchStage.EXPERIMENT: (
+        "Act as an Experiment research agent. Find datasets, baselines, protocols, metrics and reproducibility details "
+        "needed to test the hypothesis. Never imply that a planned experiment was executed."
+    ),
+    ResearchStage.RESULTS: (
+        "Act as a Results research agent. Trace every value to a run artifact or an explicitly attributed source result, "
+        "and preserve uncertainty, evaluation conditions, ablations and negative results."
+    ),
+    ResearchStage.DISCUSSION: (
+        "Act as a Discussion research agent. Evaluate interpretations, alternative explanations, threats to validity "
+        "and the boundary within which conclusions can be generalized."
+    ),
+    ResearchStage.CONCLUSION: (
+        "Act as a Conclusion research agent. Identify the claims that answer the requested question, their confidence "
+        "boundaries and the most justified next step; introduce no new unsupported facts."
+    ),
+}
+
 
 class ResearcherState(TypedDict, total=False):
     task: dict
+    dependency_context: dict
     messages: list[dict]
     source_ids: list[str]
     read_slices: list[dict]
@@ -89,9 +140,11 @@ class ResearcherState(TypedDict, total=False):
     done: bool
     unresolved: list[str]
     candidate_urls: list[str]
+    retrieval_hits: list[dict]
 
 
 class ResearchState(TypedDict, total=False):
+    intent: dict
     plan: dict
     tasks: list[dict]
     gap_round: int
@@ -203,7 +256,7 @@ class ResearchEngine:
         for index, url in enumerate(self.brief.source_urls):
 
             async def fetch(url=url):
-                source = await self.evidence.fetch(url, self.mode)
+                source = await self.evidence.fetch(url, self.mode, self.profile.parser_mode)
                 await self.db.attach_source(
                     self.tenant, self.run_id, self.fence, source.model_dump(mode="json")
                 )
@@ -218,6 +271,68 @@ class ResearchEngine:
                     {"source_url": url, "error": type(exc).__name__},
                 )
         return {"gap_round": 0, "patch_round": 0, "revision": 0}
+
+    async def understand(self, state):
+        """Compile a messy request into the paper-shaped work that is actually needed."""
+        await self.phase("scoping")
+        sources = await self.sources()
+        if self.profile.variant == "B0":
+            stage = (
+                ResearchStage.METHODOLOGY
+                if self.brief.template == "technical_comparison"
+                else ResearchStage.RELATED_WORK
+            )
+            intent = ResearchIntent(
+                normalized_question=self.brief.question,
+                mode="decision_support" if self.brief.template == "technical_comparison" else "literature_review",
+                stages=[
+                    {
+                        "stage": stage,
+                        "objective": self.brief.question,
+                        "methods": [ResearchMethod.LITERATURE_SEARCH],
+                        "deliverable": "Evidence-grounded synthesis",
+                        "reason": "Single-researcher baseline preserves the requested scope.",
+                        "role": "deliverable",
+                    }
+                ],
+                source_assignments=[
+                    {"source_id": source.id, "role": "user_material", "reason": "User supplied source"}
+                    for source in sources
+                ],
+            )
+        else:
+            payload = await self.context(
+                "research_director",
+                "scope",
+                {
+                    "available_sources": [
+                        {"source_id": source.id, "title": source.title, "url": source.url, "filename": source.filename}
+                        for source in sources
+                    ],
+                    "available_capabilities": ["search", "fetch", "read_source"],
+                    "instructions": (
+                        "Infer the user's research intent instead of asking them to choose a template. Select only the paper "
+                        "modules the user wants as role=deliverable. Add hidden role=supporting modules when a deliverable"
+                        " needs their research. For example, Introduction or Methodology often depends_on Related Work;"
+                        " Experiment may depend_on Methodology. Supporting modules are internal evidence producers, not final"
+                        " report sections. Introduction means constructing context -> concrete gap -> "
+                        "objective -> rationale -> significance; related_work means evidence-backed literature synthesis; "
+                        "methodology means critique or design; experiment means reproduction or an executable protocol; "
+                        "results is allowed only when result evidence already exists. Assign each supplied source a semantic "
+                        "role. Put any requested but unavailable capability, especially code or experiment execution, in "
+                        "capability_gaps. State useful assumptions, but do not manufacture clarification questions."
+                    ),
+                },
+                [],
+            )
+            intent = ResearchIntent.model_validate(
+                await self.gateway.structured("research_director", "scope", payload, ResearchIntent)
+            )
+        known_sources = {source.id for source in sources}
+        if not {item.source_id for item in intent.source_assignments} <= known_sources:
+            raise ValueError("intent_invented_source_ids")
+        await self.put("intent", self.run_id + ":intent", intent.model_dump(mode="json"))
+        return {"intent": intent.model_dump(mode="json")}
 
     async def plan(self, state):
         await self.phase("planning")
@@ -241,15 +356,51 @@ class ResearchEngine:
                 "plan",
                 {
                     "variant": self.profile.variant,
-                    "max_tasks": min(3, self.profile.max_tasks),
+                    "max_tasks": min(
+                        self.profile.max_tasks,
+                        max(3, len(state["intent"]["stages"])),
+                    ),
                     "source_ids": [s.id for s in await self.sources()],
+                    "research_intent": state["intent"],
                     "instructions": "Plan independent research questions with explicit acceptance criteria. Keep all user constraints."
                     " Be concise: objectives under 120 Chinese characters, 2-3 acceptance criteria each. Do not repeat the brief's constraints."
-                    " Prefer 2-3 initial tasks. Paper review must explain principles, implementation, experiments and limitations.",
+                    " Prefer 2-3 initial tasks. Create at least one task for every selected module. Every task must name its"
+                    " paper stage, research method and concrete artifact. Respect the intent's stage dependency DAG."
+                    " Supporting tasks gather inputs for deliverable tasks and must run first. Do not add stages that the"
+                    " research director did not select.",
                 },
                 [],
             )
             plan = Plan.model_validate(await self.gateway.structured("planner", "plan", payload, Plan))
+        plan.intent = ResearchIntent.model_validate(state["intent"])
+        decisions = {decision.stage: decision for decision in plan.intent.stages}
+        if self.profile.variant == "B0":
+            decision = plan.intent.stages[0]
+            for task in plan.tasks:
+                task.stage = decision.stage
+                task.method = decision.methods[0]
+                task.deliverable = decision.deliverable
+                task.output_role = decision.role
+        if any(
+            task.stage not in decisions or task.method not in decisions[task.stage].methods
+            for task in plan.tasks
+        ):
+            raise ValueError("planner_task_outside_research_intent")
+        tasks_by_stage = {
+            stage: [task for task in plan.tasks if task.stage == stage] for stage in decisions
+        }
+        if any(not tasks for tasks in tasks_by_stage.values()):
+            raise ValueError("planner_omitted_research_stage")
+        for task in plan.tasks:
+            decision = decisions[task.stage]
+            task.output_role = decision.role
+            dependency_ids = [
+                dependency.id
+                for stage in decision.depends_on
+                for dependency in tasks_by_stage[stage]
+            ]
+            task.depends_on = list(dict.fromkeys(task.depends_on + dependency_ids))
+        plan = Plan.model_validate(plan.model_dump(mode="json"))
         if len(plan.tasks) > self.profile.max_tasks:
             raise ValueError("planner_exceeded_task_limit")
         mapping = {t.id: stable_id(self.run_id, "task", t.id) for t in plan.tasks}
@@ -285,6 +436,11 @@ class ResearchEngine:
                     search_cap - sum(a["kind"] == "search" for a in task_tools),
                 ),
             )
+            remaining_retrievals = max(
+                0,
+                self.profile.max_retrieval_calls
+                - sum(a["kind"] == "retrieve" for a in task_tools),
+            )
             remaining_tools = min(
                 self.profile.max_tool_calls - run["tool_calls"],
                 (self.profile.max_tool_calls if self.profile.variant == "B0" else self.profile.max_task_tools)
@@ -296,7 +452,12 @@ class ResearchEngine:
                     "unresolved": state.get("unresolved", [])
                     + ["Tool limit reached; extract already-read evidence"],
                 }
-            available_tools = [t for t in TOOLS if remaining_searches or t["function"]["name"] != "search"]
+            available_tools = [
+                tool
+                for tool in TOOLS
+                if (remaining_searches or tool["function"]["name"] != "search")
+                and (remaining_retrievals or tool["function"]["name"] != "search_sources")
+            ]
             iteration = state.get("iteration", 0)
             max_turns = (
                 self.profile.max_tool_calls if self.profile.variant == "B0" else self.profile.max_task_tools
@@ -308,15 +469,20 @@ class ResearchEngine:
                 }
             messages = state.get("messages", [])
             if not messages:
+                module_instruction = STAGE_AGENT_INSTRUCTIONS[task.stage]
                 payload = await self.context(
-                    "researcher",
+                    task.stage.value + "_agent",
                     f"{task.id}:initial",
                     {
                         "task": task.model_dump(mode="json"),
+                        "dependency_context": state.get("dependency_context", {}),
                         "source_ids": state.get("source_ids", []),
+                        "retrieval_hits": state.get("retrieval_hits", []),
                         "instructions": "Choose search/fetch/read iteratively. Read original evidence and limitations."
                         " Fetch promising search results and read them before searching again; summaries are not evidence."
-                        " Stop with a short final message when sufficient; extraction runs next. Never spawn agents.",
+                        " For every retrieval hit you use, call read_source around its start/end before extraction."
+                        " Stop with a short final message when sufficient; extraction runs next. Never spawn agents. "
+                        + module_instruction,
                     },
                     [],
                     task.id,
@@ -328,13 +494,16 @@ class ResearchEngine:
             if token_upper_bound({"messages": messages, "tools": TOOLS}) > self.profile.prompt_token_limit:
                 # Begin a fresh bounded provider conversation at a completed tool boundary. Persisted sources/constraints survive.
                 payload = await self.context(
-                    "researcher",
+                    task.stage.value + "_agent",
                     f"{task.id}:rebuild:{iteration}",
                     {
                         "task": task.model_dump(mode="json"),
+                        "dependency_context": state.get("dependency_context", {}),
                         "source_ids": state.get("source_ids", []),
+                        "retrieval_hits": state.get("retrieval_hits", []),
                         "unresolved": state.get("unresolved", []),
-                        "instructions": "Continue from artifacts; re-read source ranges when needed.",
+                        "instructions": "Continue from artifacts; re-read source ranges when needed. "
+                        + STAGE_AGENT_INSTRUCTIONS[task.stage],
                     },
                     [
                         {"id": s["source_id"] + ":" + str(s["start"]), **s}
@@ -372,6 +541,7 @@ class ResearchEngine:
             task = ResearchTask.model_validate(state["task"])
             sources = set(state.get("source_ids", []))
             slices = list(state.get("read_slices", []))
+            retrieval_hits = list(state.get("retrieval_hits", []))
             messages = list(state["messages"])
             unresolved = list(state.get("unresolved", []))
             candidates = set(state.get("candidate_urls", self.brief.source_urls))
@@ -397,7 +567,7 @@ class ResearchEngine:
                             if match is None:
                                 raise ValueError("source_outside_frozen_corpus")
                             return {"source_id": match.id, "title": match.title, "warnings": match.warnings}
-                        source = await self.evidence.fetch(args.url, self.mode)
+                        source = await self.evidence.fetch(args.url, self.mode, self.profile.parser_mode)
                         await self.db.attach_source(
                             self.tenant,
                             self.run_id,
@@ -406,6 +576,14 @@ class ResearchEngine:
                             related=args.url not in self.brief.source_urls,
                         )
                         return {"source_id": source.id, "title": source.title, "warnings": source.warnings}
+                    if name == "search_sources":
+                        return await self.evidence.search(
+                            sorted(sources),
+                            args.query,
+                            self.profile.retrieval_strategy,
+                            args.limit,
+                            0 if self.mode == "fixture" else self.db.settings.index_wait_seconds,
+                        )
                     if args.source_id not in sources:
                         raise ValueError("source_not_authorized_for_task")
                     _, doc = await self.evidence.document(args.source_id)
@@ -422,12 +600,25 @@ class ResearchEngine:
 
                 try:
                     result = await self.gateway.tool(
-                        name if name in TOOL_MODELS else "invalid_tool", key, operation, task.id
+                        "retrieve" if name == "search_sources" else name if name in TOOL_MODELS else "invalid_tool",
+                        key,
+                        operation,
+                        task.id,
                     )
                     if "source_id" in result:
                         sources.add(result["source_id"])
                     if "results" in result:
                         candidates.update(r["url"] for r in result["results"] if r.get("url"))
+                        if name == "search_sources":
+                            for hit in result["results"]:
+                                if not any(old.get("chunk_id") == hit.get("chunk_id") for old in retrieval_hits):
+                                    retrieval_hits.append(hit)
+                    if name == "search_sources" and result.get("fallback"):
+                        await self.put(
+                            "warning",
+                            key + ":retrieval-fallback",
+                            {"task_id": task.id, "reason": result["fallback"]},
+                        )
                     if "text" in result:
                         if result not in slices:
                             slices.append(result)
@@ -454,6 +645,7 @@ class ResearchEngine:
                 "messages": messages,
                 "source_ids": sorted(sources),
                 "read_slices": slices,
+                "retrieval_hits": retrieval_hits,
                 "unresolved": unresolved,
                 "candidate_urls": sorted(candidates),
             }
@@ -554,14 +746,71 @@ class ResearchEngine:
                     "recursion_limit": 200,
                 }
                 existing = await graph.aget_state(config)
+                dependency_claims = [
+                    claim for claim in await self.claims() if claim["task_id"] in task.depends_on
+                ]
+                dependency_span_ids = {
+                    span_id for claim in dependency_claims for span_id in claim["span_ids"]
+                }
+                dependency_spans = [
+                    span
+                    for span in await self.db.records(self.tenant, self.run_id, "span")
+                    if span["id"] in dependency_span_ids
+                ]
+                dependency_findings = [
+                    finding
+                    for finding in await self.db.records(self.tenant, self.run_id, "finding")
+                    if finding["task_id"] in task.depends_on
+                ]
+                inherited_sources = {span["source_id"] for span in dependency_spans}
+                authorized_sources = sorted(set(task.source_ids) | inherited_sources)
+                retrieval = {"results": [], "strategy": "sequential", "fallback": None}
+                if (
+                    not existing.values
+                    and authorized_sources
+                    and self.profile.retrieval_strategy != "sequential"
+                ):
+
+                    async def initial_retrieval():
+                        return await self.evidence.search(
+                            authorized_sources,
+                            task.query + "\n" + task.objective,
+                            self.profile.retrieval_strategy,
+                            8,
+                            0 if self.mode == "fixture" else self.db.settings.index_wait_seconds,
+                        )
+
+                    retrieval = await self.gateway.tool(
+                        "retrieve", f"{task.id}:retrieve:initial", initial_retrieval, task.id
+                    )
+                    if self.db.settings.retrieval_shadow:
+                        await self.put(
+                            "retrieval_shadow",
+                            f"{task.id}:retrieval-shadow",
+                            {"task_id": task.id, **retrieval},
+                        )
+                        retrieval = {**retrieval, "results": []}
+                    if retrieval.get("fallback"):
+                        await self.put(
+                            "warning",
+                            f"{task.id}:retrieval-fallback",
+                            {"task_id": task.id, "reason": retrieval["fallback"]},
+                        )
                 initial = (
                     None
                     if existing.values
                     else {
                         "task": task.model_dump(mode="json"),
+                        "dependency_context": {
+                            "claims": dependency_claims,
+                            "spans": dependency_spans,
+                            "findings": dependency_findings,
+                            "note": "Unreviewed prior-module evidence; re-read original sources before extending claims.",
+                        },
                         "messages": [],
-                        "source_ids": task.source_ids,
+                        "source_ids": authorized_sources,
                         "read_slices": [],
+                        "retrieval_hits": retrieval.get("results", []),
                         "iteration": 0,
                         "unresolved": [],
                     }
@@ -599,6 +848,9 @@ class ResearchEngine:
             if draft.paper:
                 cited.update(draft.paper.claim_ids)
                 cited.update(c for x in draft.paper.limitations + draft.paper.ideas for c in x.claim_ids)
+            if draft.introduction:
+                cited.update(draft.introduction.claim_ids)
+            cited.update(c for experiment in draft.experiments for c in experiment.claim_ids)
             claims = [c for c in claims if c["id"] in cited]
             cited_spans = {s for c in claims for s in c["span_ids"]}
             spans = [s for s in spans if s["id"] in cited_spans]
@@ -606,6 +858,7 @@ class ResearchEngine:
         payload = {
             "role": "reviewer",
             "brief": self.brief.model_dump(mode="json"),
+            "research_intent": state.get("intent") or state.get("plan", {}).get("intent"),
             "claims": claims,
             "spans": spans,
             "question_ids": question_ids,
@@ -613,7 +866,19 @@ class ResearchEngine:
             "gap_round": state.get("gap_round", 0),
             "report": state.get("report"),
             "tasks": [
-                {k: t[k] for k in ("id", "question_id", "objective", "execution_status", "stop_reason")}
+                {
+                    k: t[k]
+                    for k in (
+                        "id",
+                        "question_id",
+                        "objective",
+                        "stage",
+                        "method",
+                        "output_role",
+                        "execution_status",
+                        "stop_reason",
+                    )
+                }
                 for t in state["tasks"]
             ],
             "sources": [
@@ -629,7 +894,9 @@ class ResearchEngine:
             " Do not treat author-reported results as reproduced. Mark research hypotheses as hypotheses, not established facts."
             " For report defects set location to the exact node ID, or 'paper' for the structured paper block."
             " Keep each finding concise (reason and suggestion under 160 Chinese characters). Group repeated issues."
-            " Return gap tasks only when missing evidence can materially change the answer.",
+            " Verify that every selected research stage has its promised deliverable. Introduction must make the evidence-backed"
+            " context, gap, objective, rationale and significance legible. Experiment outputs must disclose whether anything was"
+            " actually executed. Return gap tasks only when missing evidence can materially change the answer.",
         }
         key = f"review:g{state.get('gap_round', 0)}:r{state.get('revision', 0)}"
         payload = await self.evidence_context("reviewer", key, payload)
@@ -666,6 +933,14 @@ class ResearchEngine:
                 location = next((n for n in locations if error.startswith(n + ":")), None)
                 if not location and error.startswith("paper ") and state["report"].get("paper"):
                     location = "paper"
+                if not location and error.startswith("introduction:") and state["report"].get(
+                    "introduction"
+                ):
+                    location = "introduction"
+                if not location and error.startswith("experiments:") and state["report"].get(
+                    "experiments"
+                ):
+                    location = "experiments"
                 if location:
                     grouped.setdefault(location, []).append(error)
             for location, reasons in grouped.items():
@@ -738,8 +1013,13 @@ class ResearchEngine:
             t["id"]: stable_id(self.run_id, "gap", str(state["gap_round"]), t["id"]) for t in proposals
         }
         known = {t["id"] for t in tasks}
+        intent = ResearchIntent.model_validate(state.get("intent") or state["plan"]["intent"])
+        decisions = {decision.stage: decision for decision in intent.stages}
         for proposal in proposals:
             t = ResearchTask.model_validate(proposal)
+            if t.stage not in decisions or t.method not in decisions[t.stage].methods:
+                raise ValueError("gap_task_outside_research_intent")
+            t.output_role = decisions[t.stage].role
             t.id = mapping[t.id]
             # Reviewer may reference existing tasks, but cannot introduce cycles or hidden dependencies.
             if not set(t.depends_on) <= known:
@@ -762,6 +1042,8 @@ class ResearchEngine:
         payload = {
             "role": "writer",
             "brief": self.brief.model_dump(mode="json"),
+            "research_intent": state.get("intent") or state.get("plan", {}).get("intent"),
+            "plan": state.get("plan"),
             "claims": claims,
             "spans": await self.db.records(self.tenant, self.run_id, "span"),
             "findings": [
@@ -774,10 +1056,18 @@ class ResearchEngine:
             " Unknown data must stay unknown. Do not assign unsupported scores."
             " Technical comparison needs a comparison_table and conditional decision memo. Paper review must include the"
             " paper object: explain principles, implementation, experiment design, author/inferred limitations and actionable"
-            " hypotheses with baseline, metric and failure risk. Novelty is unverified. No experiment execution.",
+            " hypotheses with baseline, metric and failure risk. Novelty is unverified. Populate the structured introduction"
+            " object whenever Introduction is selected, following context -> gap -> objective -> rationale -> significance."
+            " Populate structured experiments whenever Experiment is selected. No experiment execution.",
         }
         payload["instructions"] += (
-            " Keep the report concise: at most 8 nodes, under 4000 Chinese characters of prose. Do not repeat the evidence appendix in report prose."
+            " Organize the report by the selected research stages, set stage on every substantive node, and make each node's"
+            " output_mode explicit. For introduction use context -> gap -> objective -> rationale -> significance, not a generic"
+            " summary. For related_work compare claims, methods and limitations across sources. For experiment return an"
+            " experiment_plan unless actual run artifacts are present; set execution_status honestly. Keep the report concise:"
+            " Compose only role=deliverable modules into report sections. Use claims from role=supporting tasks inside those"
+            " deliverables, but never emit a standalone section for a supporting module."
+            " at most 8 nodes, under 4000 Chinese characters of prose. Do not repeat the evidence appendix in report prose."
         )
         payload = await self.evidence_context("writer", "draft", payload)
         report = ReportDraft.model_validate(
@@ -794,7 +1084,7 @@ class ResearchEngine:
         allowed = {
             f["location"] for f in state["review"]["findings"] if f["severity"] in {"error", "warning"}
         }
-        allowed &= {n.id for n in report.nodes} | {"paper"}
+        allowed &= {n.id for n in report.nodes} | {"paper", "introduction", "experiments"}
         if not allowed:
             return {"patch_round": self.profile.max_patch_rounds}
         round_ = state.get("patch_round", 0) + 1
@@ -807,7 +1097,8 @@ class ResearchEngine:
             "claims": await self.claims(),
             "spans": await self.db.records(self.tenant, self.run_id, "span"),
             "instructions": "Replace only explicitly allowed existing nodes. Preserve all other IDs. Do not rewrite the report."
-            " The structured paper block may be replaced only when 'paper' is explicitly allowed; otherwise return paper=null.",
+            " Structured paper, introduction and experiments blocks may be replaced only when their matching location is"
+            " explicitly allowed; otherwise return the corresponding field as null.",
         }
         payload = await self.evidence_context("patcher", f"patch:{round_}", payload)
         patch = ReportPatch.model_validate(
@@ -821,6 +1112,14 @@ class ResearchEngine:
             if "paper" not in allowed or report.paper is None:
                 raise ValueError("paper_patch_not_authorized")
             report.paper = patch.paper
+        if patch.introduction is not None:
+            if "introduction" not in allowed or report.introduction is None:
+                raise ValueError("introduction_patch_not_authorized")
+            report.introduction = patch.introduction
+        if patch.experiments is not None:
+            if "experiments" not in allowed or not report.experiments:
+                raise ValueError("experiments_patch_not_authorized")
+            report.experiments = patch.experiments
         replacements = {n.id: n for n in patch.replacements}
         report.nodes = [replacements.get(n.id, n) for n in report.nodes]
         report.unresolved = list(dict.fromkeys(report.unresolved + patch.unresolved))
@@ -879,6 +1178,49 @@ class ResearchEngine:
             n.kind == "comparison_table" for n in report.nodes
         ):
             errors.append("comparison matrix missing")
+        intent_data = state.get("intent") or state.get("plan", {}).get("intent")
+        if intent_data:
+            intent = ResearchIntent.model_validate(intent_data)
+            delivered = {node.stage for node in report.nodes if node.stage is not None}
+            if report.introduction:
+                delivered.add(ResearchStage.INTRODUCTION)
+            if report.experiments:
+                delivered.add(ResearchStage.EXPERIMENT)
+            for decision in intent.stages:
+                if decision.role != "deliverable":
+                    continue
+                if decision.stage not in delivered:
+                    errors.append(f"research stage missing: {decision.stage.value}")
+            supporting = {decision.stage for decision in intent.stages if decision.role == "supporting"}
+            for node in report.nodes:
+                if node.stage in supporting:
+                    errors.append(node.id + ": supporting research stage leaked into final report")
+            if ResearchStage.INTRODUCTION in supporting and report.introduction:
+                errors.append("introduction: supporting research stage leaked into final report")
+            if ResearchStage.EXPERIMENT in supporting and report.experiments:
+                errors.append("experiments: supporting research stage leaked into final report")
+            for node in report.nodes:
+                if node.output_mode == "experiment_result" and node.execution_status != "executed":
+                    errors.append(node.id + ": experiment result is not marked executed")
+                if node.execution_status == "executed" and node.output_mode != "experiment_result":
+                    errors.append(node.id + ": executed status requires an experiment result")
+            selected = {
+                decision.stage for decision in intent.stages if decision.role == "deliverable"
+            }
+            if ResearchStage.INTRODUCTION in selected and report.introduction is None:
+                errors.append("introduction: structured argument missing")
+            if ResearchStage.EXPERIMENT in selected and not report.experiments:
+                errors.append("experiments: structured experiment package missing")
+        if report.introduction:
+            if not set(report.introduction.claim_ids) <= set(claim_map):
+                errors.append("introduction: unknown claim reference")
+            if not report.introduction.claim_ids:
+                errors.append("introduction: gap/context require evidence")
+        for experiment in report.experiments:
+            if not set(experiment.claim_ids) <= set(claim_map):
+                errors.append(f"experiments:{experiment.id}: unknown claim reference")
+            if experiment.execution_status == "executed" and not experiment.artifact_ids:
+                errors.append(f"experiments:{experiment.id}: executed experiment lacks artifacts")
         if report.paper:
             refs = report.paper.claim_ids + [x for lim in report.paper.limitations for x in lim.claim_ids]
             refs += [x for idea in report.paper.ideas for x in idea.claim_ids]
@@ -895,6 +1237,11 @@ class ResearchEngine:
             refs.update(c for item in report.paper.limitations + report.paper.ideas for c in item.claim_ids)
             if not refs <= accepted:
                 errors.append("paper references unaccepted claims")
+        if report.introduction and not set(report.introduction.claim_ids) <= accepted:
+            errors.append("introduction: references unaccepted claims")
+        for experiment in report.experiments:
+            if not set(experiment.claim_ids) <= accepted:
+                errors.append(f"experiments:{experiment.id}: references unaccepted claims")
         if not claims:
             errors.append("no valid evidence collected")
         if not review.get("sufficient") or any(f["severity"] == "error" for f in review.get("findings", [])):
@@ -927,6 +1274,7 @@ class ResearchEngine:
             manifest={
                 "app_version": __version__,
                 "workflow_version": "v1",
+                "research_intent": state.get("intent") or state.get("plan", {}).get("intent"),
                 "mode": self.mode,
                 "brief_hash": digest(self.brief.model_dump(mode="json")),
                 "profile": self.profile.model_dump(),
@@ -940,7 +1288,7 @@ class ResearchEngine:
                 "spent_usd": float(run["spent_usd"]),
                 "reserved_usd": float(run["reserved_usd"]),
                 "tokens": run["tokens"],
-                "prompt_version": "v1",
+                "prompt_version": "v2-paper-stage-intent",
                 "source_status": "snapshot_only; current retraction status unknown",
             },
         )
@@ -953,6 +1301,7 @@ class ResearchEngine:
         graph = StateGraph(ResearchState)
         for name, node in [
             ("intake", self.bootstrap),
+            ("scope", self.understand),
             ("plan", self.plan),
             ("research", self.research),
             ("review", self.review),
@@ -963,7 +1312,8 @@ class ResearchEngine:
         ]:
             graph.add_node(name, node)
         graph.add_edge(START, "intake")
-        graph.add_edge("intake", "plan")
+        graph.add_edge("intake", "scope")
+        graph.add_edge("scope", "plan")
         graph.add_edge("plan", "research")
         graph.add_edge("research", "review")
         graph.add_conditional_edges("review", self.route_review)
