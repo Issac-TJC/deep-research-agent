@@ -57,7 +57,7 @@ async def execute_claim(db: Database, store: ObjectStore, claim: dict):
         quality = max(reports, key=lambda p: p["revision"])["quality_status"] if reports else "unchecked"
         await db.finish(tenant, run_id, fence, "completed", result.get("stop_reason", "completed"), quality)
     except BudgetExceeded as exc:
-        await engine.partial(str(exc))
+        await engine.partial("budget:" + str(exc))
         await db.finish(tenant, run_id, fence, "completed", "budget:" + str(exc), "needs_review")
     except ProviderError as exc:
         # Exhausted logical actions cannot gain new retries by repeatedly resuming the run.

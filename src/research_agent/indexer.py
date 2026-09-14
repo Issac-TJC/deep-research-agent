@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 
+import httpx
+
 from research_agent.db import Database
 from research_agent.evidence import EvidenceService
 from research_agent.retrieval import EmbeddingClient, chunk_document
@@ -12,6 +14,21 @@ from research_agent.settings import Settings
 from research_agent.storage import ObjectStore
 
 logger = logging.getLogger("research.indexer")
+
+
+async def embed_with_backoff(client: EmbeddingClient, texts: list[str]) -> list[list[float]]:
+    """Retry only transient service failures; total delay is bounded to seven seconds."""
+    for attempt, delay in enumerate((1, 2, 4)):
+        try:
+            return await client.embed(texts)
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code not in {429, 502, 503, 504} or attempt == 2:
+                raise
+        except (httpx.ConnectError, httpx.ReadTimeout):
+            if attempt == 2:
+                raise
+        await asyncio.sleep(delay)
+    raise RuntimeError("embedding_retry_exhausted")
 
 
 async def keep_lease(callback, seconds: int):
@@ -77,7 +94,7 @@ async def process_index(db: Database, store: ObjectStore, claimed: dict):
         )
         for start in range(0, len(chunks), 32):
             batch = chunks[start : start + 32]
-            vectors = await client.embed([chunk["text"] for chunk in batch])
+            vectors = await embed_with_backoff(client, [chunk["text"] for chunk in batch])
             await db.save_embeddings(
                 tenant,
                 source_id,

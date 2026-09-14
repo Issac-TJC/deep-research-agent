@@ -8,7 +8,14 @@ from collections.abc import Awaitable, Callable
 from opentelemetry import trace
 from pydantic import BaseModel, ValidationError
 
-from research_agent.context import POLICY, token_upper_bound
+from research_agent.context import (
+    POLICY,
+    budget_group_for_role,
+    estimated_tokens,
+    output_ceiling_for_role,
+    serialized_bytes,
+    token_upper_bound,
+)
 from research_agent.contracts import RunProfile
 from research_agent.db import BudgetExceeded, Database, StaleLease
 from research_agent.providers import ModelProvider, ProviderError
@@ -32,7 +39,7 @@ class Gateway:
         from research_agent.observability import configure
 
         configure()
-        self.tracer = trace.get_tracer("research-agent", "0.1.0")
+        self.tracer = trace.get_tracer("research-agent", "0.2.0")
 
     async def _invoke(
         self,
@@ -44,6 +51,10 @@ class Gateway:
         task_id=None,
         closing=False,
         estimate=None,
+        role="legacy",
+        budget_group="legacy",
+        request=None,
+        diagnostics=None,
     ) -> dict:
         for attempt in range(self.profile.max_retries + 1):
             action_id = f"{key}:attempt:{attempt}"
@@ -54,6 +65,7 @@ class Gateway:
                 # An interrupted reserved attempt has an unknown external outcome. Keep its reservation.
                 continue
             attempt_usd, attempt_tokens = estimate() if estimate else (usd, tokens)
+            diagnostic = diagnostics() if diagnostics else {}
             await self.db.reserve(
                 self.tenant,
                 self.run_id,
@@ -64,6 +76,12 @@ class Gateway:
                 attempt_tokens,
                 task_id,
                 closing,
+                role,
+                budget_group,
+                diagnostic.get("serialized_bytes", 0),
+                diagnostic.get("estimated_input_tokens", 0),
+                diagnostic.get("output_token_ceiling", 0),
+                request() if callable(request) else request,
             )
             started = time.monotonic()
             parent = trace.NonRecordingSpan(
@@ -135,27 +153,31 @@ class Gateway:
         schema: type[BaseModel] | None = None,
         task_id=None,
         closing=False,
+        role: str = "researcher",
     ) -> dict:
-        input_bound = token_upper_bound({"messages": messages, "tools": tools})
-        if input_bound > self.profile.prompt_token_limit:
+        request_payload = {"messages": messages, "tools": tools}
+        input_bytes = token_upper_bound(request_payload)
+        input_estimate = estimated_tokens(request_payload)
+        if input_bytes > self.profile.prompt_token_limit:
             raise BudgetExceeded("prompt_context_limit")
         # Thinking and visible JSON share the output allowance. Structured tasks need
         # enough room for both; a truncated attempt may grow within the frozen profile.
-        role_cap = 16384 if schema else 4096
-        output_bound = min(self.profile.max_output_tokens, role_cap)
+        output_bound = output_ceiling_for_role(role, self.profile.max_output_tokens)
         s = self.settings
         reserve = (
             0
             if self.mode == "fixture"
-            else (input_bound * s.model_input_usd_per_million + output_bound * s.model_output_usd_per_million)
+            else (input_estimate * s.model_input_usd_per_million + output_bound * s.model_output_usd_per_million)
             / 1_000_000
         )
 
         request_messages = list(messages)
 
         def estimate():
-            current = token_upper_bound({"messages": request_messages, "tools": tools})
-            if current > self.profile.prompt_token_limit:
+            current_payload = {"messages": request_messages, "tools": tools}
+            current_bytes = token_upper_bound(current_payload)
+            current = estimated_tokens(current_payload)
+            if current_bytes > self.profile.prompt_token_limit:
                 raise BudgetExceeded("prompt_context_limit")
             usd = (
                 0
@@ -164,6 +186,14 @@ class Gateway:
                 / 1_000_000
             )
             return usd, current + output_bound
+
+        def diagnostics():
+            current_payload = {"messages": request_messages, "tools": tools}
+            return {
+                "serialized_bytes": serialized_bytes(current_payload),
+                "estimated_input_tokens": estimated_tokens(current_payload),
+                "output_token_ceiling": output_bound,
+            }
 
         async def call():
             nonlocal output_bound
@@ -222,7 +252,18 @@ class Gateway:
                 raise error from cause
 
         return await self._invoke(
-            "model", key, call, reserve, input_bound + output_bound, task_id, closing, estimate
+            "model",
+            key,
+            call,
+            reserve,
+            input_estimate + output_bound,
+            task_id,
+            closing,
+            estimate,
+            role,
+            budget_group_for_role(role),
+            lambda: {"messages": request_messages, "tools": tools},
+            diagnostics,
         )
 
     async def structured(self, role: str, key: str, payload: dict, schema: type[BaseModel], closing=False):
@@ -237,7 +278,7 @@ class Gateway:
             },
             {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
         ]
-        return (await self.model(key, messages, schema=schema, closing=closing))["value"]
+        return (await self.model(key, messages, schema=schema, closing=closing, role=role))["value"]
 
     async def tool(self, kind: str, key: str, operation, task_id=None):
         usd = self.settings.search_usd_per_call if kind == "search" and self.mode == "live" else 0
@@ -246,4 +287,12 @@ class Gateway:
             result = await operation()
             return result, {"usd": usd}
 
-        return await self._invoke(kind, key, call, usd, task_id=task_id)
+        return await self._invoke(
+            kind,
+            key,
+            call,
+            usd,
+            task_id=task_id,
+            role="tool",
+            budget_group=budget_group_for_role(None, kind),
+        )

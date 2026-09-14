@@ -75,10 +75,11 @@ class FixtureProvider:
             search = next((r for r in responses if "results" in r), None)
             fetched = next((r for r in responses if "source_id" in r and "text" not in r), None)
             read = next((r for r in responses if "text" in r), None)
-            existing = payload.get("source_ids", [])
-            if "hybrid" in payload["task"]["query"].lower():
-                existing = []
-            if read:
+            progress = payload.get("progress", {})
+            existing = payload.get("source_ids", []) or progress.get("authorized_source_ids", [])
+            candidates = progress.get("candidate_urls", [])
+            has_read = read or any(progress.get("read_ranges", {}).values())
+            if has_read:
                 message["content"] = "Source read; ready to extract evidence."
             elif fetched or existing:
                 name, args = (
@@ -89,8 +90,9 @@ class FixtureProvider:
                         "length": 6000,
                     },
                 )
-            elif search:
-                name, args = "fetch", {"url": search["results"][0]["url"]}
+            elif search or candidates:
+                url = search["results"][0]["url"] if search else candidates[0]
+                name, args = "fetch", {"url": url}
             else:
                 name, args = "search", {"query": payload["task"]["query"]}
             if not message["content"]:

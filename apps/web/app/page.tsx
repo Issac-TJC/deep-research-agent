@@ -58,6 +58,7 @@ export default function Home() {
   const [run, setRun] = useState<Dict | null>(null);
   const [report, setReport] = useState<Dict | null>(null);
   const [usage, setUsage] = useState<Dict[]>([]);
+  const [usageSummary, setUsageSummary] = useState<Dict | null>(null);
   const [events, setEvents] = useState<Dict[]>([]);
   const [question, setQuestion] = useState("");
   const [uploads, setUploads] = useState<Dict[]>([]);
@@ -79,12 +80,14 @@ export default function Home() {
       const next = await api(`/research-runs/${id}`);
       setRun(next);
       currentRun.current = next;
-      const [pkg, calls] = await Promise.all([
+      const [pkg, calls, summary] = await Promise.all([
         loadReport(id),
         api(`/research-runs/${id}/usage`),
+        api(`/research-runs/${id}/usage-summary`),
       ]);
       setReport(pkg);
       setUsage(calls);
+      setUsageSummary(summary);
       await loadRuns();
     },
     [loadRuns],
@@ -782,6 +785,30 @@ export default function Home() {
                         </div>
                       ))}
                       <h3>调用与用量</h3>
+                      {usageSummary && (
+                        <div className="usage-summary">
+                          <strong>
+                            {Number(usageSummary.totals.tokens).toLocaleString()} / {Number(usageSummary.soft_target).toLocaleString()} soft
+                          </strong>
+                          <progress
+                            max={usageSummary.hard_cap}
+                            value={Math.min(usageSummary.totals.tokens, usageSummary.hard_cap)}
+                          />
+                          <small>
+                            soft 剩余 {Number(usageSummary.soft_remaining).toLocaleString()} · hard 剩余 {Number(usageSummary.hard_remaining).toLocaleString()} · 缓存命中 {Number(Object.values(usageSummary.budget_groups).reduce((sum: number, group: any) => sum + group.cache_hit_tokens, 0)).toLocaleString()}
+                          </small>
+                          {Object.entries(usageSummary.budget_groups).map(([name, group]: [string, any]) => (
+                            <small key={name}>
+                              {name}: {Number(group.input_tokens + group.output_tokens).toLocaleString()} / {Number(group.target).toLocaleString()} token · {group.model_calls} 次模型 · {dollars(group.usd)}
+                            </small>
+                          ))}
+                          {usageSummary.degradation_events.map((event: Dict) => (
+                            <span className="error" key={event.seq}>
+                              降级 {event.payload.level}%：{event.payload.reason}
+                            </span>
+                          ))}
+                        </div>
+                      )}
                       {usage.map((u) => (
                         <div className="event" key={u.id}>
                           <span>

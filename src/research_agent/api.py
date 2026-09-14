@@ -27,7 +27,7 @@ async def lifespan(app):
     await db.close()
 
 
-app = FastAPI(title="Deep Research Agent", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="Deep Research Agent", version="0.2.0", lifespan=lifespan)
 
 
 def service(request: Request) -> ResearchService:
@@ -66,7 +66,7 @@ async def invalid(request, exc):
 async def health():
     from research_agent.settings import RUNTIME_FINGERPRINT
 
-    return {"status": "ok", "version": "0.1.0", "runtime_fingerprint": RUNTIME_FINGERPRINT}
+    return {"status": "ok", "version": "0.2.0", "runtime_fingerprint": RUNTIME_FINGERPRINT}
 
 
 @app.post("/research-runs", status_code=202)
@@ -120,6 +120,11 @@ async def resume(run_id: UUID, tenant: Tenant, service: Service):
 async def usage(run_id: UUID, tenant: Tenant, service: Service):
     await service.db.run(tenant, str(run_id))
     return await service.db.usage(tenant, str(run_id))
+
+
+@app.get("/research-runs/{run_id}/usage-summary")
+async def usage_summary(run_id: UUID, tenant: Tenant, service: Service):
+    return await service.db.usage_summary(tenant, str(run_id))
 
 
 @app.get("/research-runs/{run_id}/events")

@@ -4,6 +4,12 @@ COPY pyproject.toml uv.lock ./
 RUN pip install --no-cache-dir uv==0.12.13 \
     && uv sync --frozen --no-dev --no-install-project
 COPY src ./src
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       libgl1 \
+       libglib2.0-0t64 \
+       libxcb1 \
+    && rm -rf /var/lib/apt/lists/*
 ENV HF_HOME=/models/huggingface
 RUN uv sync --frozen --no-dev \
     && uv pip install --python .venv/bin/python \

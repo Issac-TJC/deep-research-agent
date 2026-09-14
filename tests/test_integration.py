@@ -16,6 +16,7 @@ from research_agent.evidence import EvidenceService
 from research_agent.fixtures import FixtureProvider
 from research_agent.gateway import Gateway
 from research_agent.indexer import process_upload
+from research_agent.retrieval import CHUNKER_VERSION
 from research_agent.worker import execute_claim
 
 pytestmark = pytest.mark.integration
@@ -53,6 +54,12 @@ async def test_complete_research_templates(env, template):
     assert final["model_calls"] > 3 and final["tool_calls"] > 0
     assert final["reserved_usd"] == 0 and final["reserved_tokens"] == 0
     assert not package.citation_errors, package.citation_errors
+    summary = await db.usage_summary(tenant, str(run["id"]))
+    assert summary["soft_target"] == 180000 and summary["hard_cap"] == 250000
+    assert summary["budget_groups"]["scope_plan"]["model_calls"] >= 2
+    scope_action = await db.action(tenant, str(run["id"]), "scope:attempt:0")
+    assert scope_action["role"] == "research_director"
+    assert scope_action["estimated_input_tokens"] > 0 and scope_action["request"]
     if template == "paper_review":
         assert package.report.paper and package.report.paper.ideas
         assert package.report.paper.reproduction_status == "not_executed"
@@ -120,9 +127,15 @@ async def test_rls_context_reset_and_checkpoint_fencing(env):
     saver = FencedSaver(db, tenant, rid, token)
     config = {"configurable": {"thread_id": rid, "checkpoint_ns": ""}}
     cp = empty_checkpoint()
-    cp["channel_values"] = {"secret": "tenant A evidence"}
-    await saver.aput(config, cp, {}, {"secret": "1"})
+    cp["channel_values"] = {
+        "secret": "tenant A evidence",
+        "progress": {"authorized_source_ids": ["source-a"], "read_ranges": {"source-a": [[0, 20]]}},
+    }
+    cp["channel_versions"] = {"secret": "1", "progress": "1"}
+    await saver.aput(config, cp, {}, {"secret": "1", "progress": "1"})
     assert (await saver.aget_tuple(config)).checkpoint["channel_values"]["secret"] == "tenant A evidence"
+    restored_progress = (await saver.aget_tuple(config)).checkpoint["channel_values"]["progress"]
+    assert restored_progress["authorized_source_ids"] == ["source-a"] and "messages" not in restored_progress
     other_saver = FencedSaver(db, env["other"], rid, token)
     assert await other_saver.aget_tuple(config) is None
     async with db.pool.connection() as conn:
@@ -208,3 +221,39 @@ async def test_hard_budget_delivers_partial_package(env):
     assert final["status"] == "completed" and final["quality_status"] == "needs_review"
     package = await env["service"].report(tenant, str(run["id"]))
     assert package.report.unresolved and package.revision == 999
+
+
+async def test_failed_embedding_build_keeps_lexical_index_and_requeues_new_version(env):
+    db, tenant = env["db"], env["tenant"]
+    source_id, old_version, new_version = "source-" + str(uuid4()), str(uuid4()), str(uuid4())
+    await db.enqueue_index(
+        tenant, source_id, "parsed-hash", old_version, CHUNKER_VERSION, "gte", "9bbca17"
+    )
+    await db.save_lexical_chunks(
+        tenant,
+        source_id,
+        "parsed-hash",
+        old_version,
+        [
+            {
+                "chunk_id": "chunk-1",
+                "ordinal": 0,
+                "start": 0,
+                "end": 8,
+                "page": 1,
+                "bbox": None,
+                "kind": "paragraph",
+                "section_path": [],
+                "block_id": "block-1",
+                "text": "evidence",
+                "lexical_text": "evidence",
+            }
+        ],
+    )
+    await db.fail_index(tenant, source_id, old_version, "HTTPStatusError:503")
+    assert (await db.usable_index_status(tenant, source_id))["index_version"] == old_version
+    await db.requeue_index(
+        tenant, source_id, "parsed-hash", new_version, CHUNKER_VERSION, "gte", "9bbca17"
+    )
+    assert (await db.index_status(tenant, source_id))["index_version"] == new_version
+    assert (await db.usable_index_status(tenant, source_id))["index_version"] == old_version

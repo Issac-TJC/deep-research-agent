@@ -79,8 +79,8 @@ services:
       HF_HUB_OFFLINE: "1"
       TRANSFORMERS_OFFLINE: "1"
       HF_HOME: /models/huggingface
-      HF_MODULES_CACHE: /tmp/hf_modules
-      SENTENCE_TRANSFORMERS_HOME: /tmp/st_cache
+      HF_MODULES_CACHE: /models/hf_modules
+      SENTENCE_TRANSFORMERS_HOME: /models/st_cache
     networks: [models]
     read_only: true
     tmpfs: ["/tmp:size=256m"]
@@ -89,6 +89,12 @@ services:
     pids_limit: 256
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8002/health', timeout=20).read()"]
+      interval: 10s
+      timeout: 30s
+      retries: 12
+      start_period: 30s
   api:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     environment: *app-env
@@ -98,7 +104,7 @@ services:
       migrate: {condition: service_completed_successfully}
       minio: {condition: service_started}
       parser: {condition: service_started}
-      embedding: {condition: service_started}
+      embedding: {condition: service_healthy}
   worker:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     command: research worker
@@ -108,7 +114,7 @@ services:
       migrate: {condition: service_completed_successfully}
       minio: {condition: service_started}
       parser: {condition: service_started}
-      embedding: {condition: service_started}
+      embedding: {condition: service_healthy}
   indexer:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     command: research indexer
@@ -118,7 +124,7 @@ services:
       migrate: {condition: service_completed_successfully}
       minio: {condition: service_started}
       parser: {condition: service_started}
-      embedding: {condition: service_started}
+      embedding: {condition: service_healthy}
   web:
     build: {context: ./apps/web}
     environment:

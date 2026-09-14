@@ -10,7 +10,16 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from research_agent import __version__
 from research_agent.checkpoints import FencedSaver
-from research_agent.context import POLICY, build_context, token_upper_bound
+from research_agent.context import (
+    POLICY,
+    ResearchProgress,
+    build_context,
+    degradation_level,
+    merge_read_ranges,
+    progress_signal,
+    relevance_terms,
+    tool_protocol_closed,
+)
 from research_agent.contracts import (
     Claim,
     EvidenceSpan,
@@ -141,6 +150,7 @@ class ResearcherState(TypedDict, total=False):
     unresolved: list[str]
     candidate_urls: list[str]
     retrieval_hits: list[dict]
+    progress: dict
 
 
 class ResearchState(TypedDict, total=False):
@@ -157,6 +167,8 @@ class ResearchState(TypedDict, total=False):
     previous_signal: str
     no_gain: bool
     pending_patch_findings: list[dict]
+    degradation_level: int
+    research_budget_exhausted: bool
 
 
 class ResearchEngine:
@@ -198,6 +210,7 @@ class ResearchEngine:
         claims = payload.pop("claims", [])
         spans = payload.pop("spans", [])
         span_map = {span["id"]: span for span in spans}
+        terms = relevance_terms(payload)
         artifacts = [
             {
                 "id": "claim:" + claim["id"],
@@ -207,25 +220,18 @@ class ResearchEngine:
             }
             for claim in claims
         ]
+        artifacts.sort(
+            key=lambda item: (
+                -len(terms & relevance_terms(item)),
+                str(item["id"]),
+            )
+        )
         payload["claims"], payload["spans"] = [], []
         payload["evidence_selection_note"] = (
             "Only claims and spans supplied in this request are available for support decisions. "
             "Omitted claim IDs remain in persistent storage but are not reviewed here. "
             "Do not infer coverage from omitted evidence or invent quotations."
         )
-        all_spans = await self.db.records(self.tenant, self.run_id, "span")
-        for source in await self.sources():
-            _, document = await self.evidence.document(source.id)
-            if self.profile.context_strategy == "full":
-                text = document.text
-            else:
-                windows = [
-                    (max(0, span["start"] - 300), min(len(document.text), span["end"] + 300))
-                    for span in all_spans
-                    if span["source_id"] == source.id
-                ]
-                text = "\n\n".join(document.text[start:end] for start, end in windows)
-            artifacts.append({"id": source.id, "title": source.title, "text": text})
         packed = await self.context(role, key, payload, artifacts)
         bundles = [a for a in packed["artifacts"] if a.get("kind") == "claim_evidence"]
         packed["claims"] = [a["claim"] for a in bundles]
@@ -247,6 +253,19 @@ class ResearchEngine:
         snapshot.id = stable_id(self.run_id, "context", key)
         await self.put("context", snapshot.id, snapshot.model_dump(mode="json"))
         return payload
+
+    async def budget_level(self) -> int:
+        run = await self.db.run(self.tenant, self.run_id)
+        level = degradation_level(int(run["tokens"]))
+        reasons = {
+            70: "capsule_required_and_duplicate_evidence_reduced",
+            85: "new_source_discovery_disabled",
+            95: "gap_research_disabled_and_writer_protected",
+        }
+        for threshold in (70, 85, 95):
+            if level >= threshold:
+                await self.db.record_degradation(self.tenant, self.run_id, threshold, reasons[threshold])
+        return level
 
     async def bootstrap(self, state):
         await self.phase("intake")
@@ -284,7 +303,9 @@ class ResearchEngine:
             )
             intent = ResearchIntent(
                 normalized_question=self.brief.question,
-                mode="decision_support" if self.brief.template == "technical_comparison" else "literature_review",
+                mode="decision_support"
+                if self.brief.template == "technical_comparison"
+                else "literature_review",
                 stages=[
                     {
                         "stage": stage,
@@ -306,7 +327,12 @@ class ResearchEngine:
                 "scope",
                 {
                     "available_sources": [
-                        {"source_id": source.id, "title": source.title, "url": source.url, "filename": source.filename}
+                        {
+                            "source_id": source.id,
+                            "title": source.title,
+                            "url": source.url,
+                            "filename": source.filename,
+                        }
                         for source in sources
                     ],
                     "available_capabilities": ["search", "fetch", "read_source"],
@@ -386,18 +412,14 @@ class ResearchEngine:
             for task in plan.tasks
         ):
             raise ValueError("planner_task_outside_research_intent")
-        tasks_by_stage = {
-            stage: [task for task in plan.tasks if task.stage == stage] for stage in decisions
-        }
+        tasks_by_stage = {stage: [task for task in plan.tasks if task.stage == stage] for stage in decisions}
         if any(not tasks for tasks in tasks_by_stage.values()):
             raise ValueError("planner_omitted_research_stage")
         for task in plan.tasks:
             decision = decisions[task.stage]
             task.output_role = decision.role
             dependency_ids = [
-                dependency.id
-                for stage in decision.depends_on
-                for dependency in tasks_by_stage[stage]
+                dependency.id for stage in decision.depends_on for dependency in tasks_by_stage[stage]
             ]
             task.depends_on = list(dict.fromkeys(task.depends_on + dependency_ids))
         plan = Plan.model_validate(plan.model_dump(mode="json"))
@@ -422,6 +444,31 @@ class ResearchEngine:
         async def decide(state):
             task = ResearchTask.model_validate(state["task"])
             run = await self.db.run(self.tenant, self.run_id)
+            level = await self.budget_level()
+            progress = ResearchProgress.model_validate(
+                state.get("progress")
+                or {
+                    "authorized_source_ids": state.get("source_ids", []),
+                    "candidate_urls": state.get("candidate_urls", self.brief.source_urls),
+                    "retrieval_hits": state.get("retrieval_hits", []),
+                    "acceptance_coverage": [],
+                    "unresolved": state.get("unresolved", []),
+                }
+            )
+            if level >= 95:
+                return {
+                    "done": True,
+                    "progress": progress.model_dump(mode="json"),
+                    "unresolved": progress.unresolved
+                    + ["Soft-token 95% threshold reached; proceeding to review and writing"],
+                }
+            if progress.no_gain_rounds >= 2:
+                return {
+                    "done": True,
+                    "progress": progress.model_dump(mode="json"),
+                    "unresolved": progress.unresolved
+                    + ["Stopped after two tool rounds without new sources, ranges, hits, or coverage"],
+                }
             usage = await self.db.usage(self.tenant, self.run_id)
             task_tools = [a for a in usage if a["task_id"] == task.id and a["kind"] != "model"]
             search_cap = (
@@ -436,10 +483,15 @@ class ResearchEngine:
                     search_cap - sum(a["kind"] == "search" for a in task_tools),
                 ),
             )
+            # Retrieval is a run-wide allowance. Using the per-task count here used
+            # to advertise search_sources after another task had exhausted the
+            # global quota, guaranteeing a late BudgetExceeded.
             remaining_retrievals = max(
                 0,
-                self.profile.max_retrieval_calls
-                - sum(a["kind"] == "retrieve" for a in task_tools),
+                self.profile.max_retrieval_calls - int(run["retrieval_calls"]),
+            )
+            retrieval_degraded = any(
+                item.startswith("search_sources: fallback:") for item in progress.unresolved
             )
             remaining_tools = min(
                 self.profile.max_tool_calls - run["tool_calls"],
@@ -456,7 +508,11 @@ class ResearchEngine:
                 tool
                 for tool in TOOLS
                 if (remaining_searches or tool["function"]["name"] != "search")
-                and (remaining_retrievals or tool["function"]["name"] != "search_sources")
+                and (
+                    (remaining_retrievals and not retrieval_degraded)
+                    or tool["function"]["name"] != "search_sources"
+                )
+                and (level < 85 or tool["function"]["name"] not in {"search", "fetch"})
             ]
             iteration = state.get("iteration", 0)
             max_turns = (
@@ -467,65 +523,38 @@ class ResearchEngine:
                     "done": True,
                     "unresolved": state.get("unresolved", []) + ["Researcher turn limit reached"],
                 }
-            messages = state.get("messages", [])
-            if not messages:
-                module_instruction = STAGE_AGENT_INSTRUCTIONS[task.stage]
-                payload = await self.context(
-                    task.stage.value + "_agent",
-                    f"{task.id}:initial",
-                    {
-                        "task": task.model_dump(mode="json"),
-                        "dependency_context": state.get("dependency_context", {}),
-                        "source_ids": state.get("source_ids", []),
-                        "retrieval_hits": state.get("retrieval_hits", []),
-                        "instructions": "Choose search/fetch/read iteratively. Read original evidence and limitations."
-                        " Fetch promising search results and read them before searching again; summaries are not evidence."
-                        " For every retrieval hit you use, call read_source around its start/end before extraction."
-                        " Stop with a short final message when sufficient; extraction runs next. Never spawn agents. "
-                        + module_instruction,
-                    },
-                    [],
-                    task.id,
-                )
-                messages = [
-                    {"role": "system", "content": POLICY},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ]
-            if token_upper_bound({"messages": messages, "tools": TOOLS}) > self.profile.prompt_token_limit:
-                # Begin a fresh bounded provider conversation at a completed tool boundary. Persisted sources/constraints survive.
-                payload = await self.context(
-                    task.stage.value + "_agent",
-                    f"{task.id}:rebuild:{iteration}",
-                    {
-                        "task": task.model_dump(mode="json"),
-                        "dependency_context": state.get("dependency_context", {}),
-                        "source_ids": state.get("source_ids", []),
-                        "retrieval_hits": state.get("retrieval_hits", []),
-                        "unresolved": state.get("unresolved", []),
-                        "instructions": "Continue from artifacts; re-read source ranges when needed. "
-                        + STAGE_AGENT_INSTRUCTIONS[task.stage],
-                    },
-                    [
-                        {"id": s["source_id"] + ":" + str(s["start"]), **s}
-                        for s in state.get("read_slices", [])
-                    ],
-                    task.id,
-                )
-                messages = [
-                    {"role": "system", "content": POLICY},
-                    {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-                ]
-            messages = messages + [
+            # A completed tool batch is a legal protocol boundary. Start a stable,
+            # bounded provider conversation from the capsule rather than replaying history.
+            payload = await self.context(
+                task.stage.value + "_agent",
+                f"{task.id}:capsule:{iteration}",
+                {
+                    "task": task.model_dump(mode="json"),
+                    "instructions": "Choose search/fetch/read iteratively. Read original evidence and limitations."
+                    " Fetch promising search results and read them before searching again; summaries are not evidence."
+                    " For every retrieval hit you use, call read_source around its start/end before extraction."
+                    " Stop with a short final message when sufficient; extraction runs next. Never spawn agents. "
+                    + STAGE_AGENT_INSTRUCTIONS[task.stage],
+                    "dependency_context": state.get("dependency_context", {}),
+                    "progress": progress.prompt_view(),
+                },
+                [],
+                task.id,
+            )
+            messages = [
+                {"role": "system", "content": POLICY},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
                 {
                     "role": "user",
                     "content": json.dumps(
                         {
                             "remaining_task_tools": remaining_tools,
                             "remaining_search_calls": remaining_searches,
+                            "degradation_level": level,
                             "instruction": "Stay within these limits. Prioritize fetching and reading existing candidates. Reserve calls for reading originals; stop once sufficient.",
                         }
                     ),
-                }
+                },
             ]
             result = await self.gateway.model(
                 f"{task.id}:decide:{iteration}", messages, tools=available_tools, task_id=task.id
@@ -535,16 +564,20 @@ class ResearchEngine:
                 "messages": messages + [message],
                 "iteration": iteration + 1,
                 "done": not bool(message.get("tool_calls")),
+                "progress": progress.model_dump(mode="json"),
             }
 
         async def use_tools(state):
             task = ResearchTask.model_validate(state["task"])
+            progress = ResearchProgress.model_validate(state.get("progress") or {})
+            before_signal = progress_signal(progress)
             sources = set(state.get("source_ids", []))
             slices = list(state.get("read_slices", []))
             retrieval_hits = list(state.get("retrieval_hits", []))
             messages = list(state["messages"])
             unresolved = list(state.get("unresolved", []))
             candidates = set(state.get("candidate_urls", self.brief.source_urls))
+            outcomes = []
             for idx, tool_call in enumerate(messages[-1].get("tool_calls", [])):
                 name = tool_call.get("function", {}).get("name", "unknown")
                 key = f"{task.id}:tool:{state['iteration']}:{idx}"
@@ -554,12 +587,16 @@ class ResearchEngine:
                         raise ValueError("tool_not_allowed")
                     args = TOOL_MODELS[name].model_validate_json(tool_call["function"]["arguments"])
                     if name == "search":
+                        if await self.budget_level() >= 85:
+                            raise BudgetExceeded("new_source_discovery_disabled")
                         if self.profile.search_policy == "frozen":
                             from research_agent.evaluation import frozen_search
 
                             return await frozen_search(self.evidence, await self.sources(), args.query)
                         return await self.search.search(args.query)
                     if name == "fetch":
+                        if await self.budget_level() >= 85:
+                            raise BudgetExceeded("new_source_discovery_disabled")
                         if args.url not in candidates:
                             raise ValueError("fetch_url_not_discovered; search for the source first")
                         if self.profile.search_policy == "frozen":
@@ -589,10 +626,23 @@ class ResearchEngine:
                     _, doc = await self.evidence.document(args.source_id)
                     if args.start >= len(doc.text):
                         raise ValueError("read_start_outside_document")
+                    requested_end = min(len(doc.text), args.start + args.length)
+                    if any(
+                        start <= args.start and end >= requested_end
+                        for start, end in progress.read_ranges.get(args.source_id, [])
+                    ):
+                        return {
+                            "source_id": args.source_id,
+                            "start": args.start,
+                            "end": requested_end,
+                            "deduplicated": True,
+                            "instruction": "This range is already in the capsule; do not read it again.",
+                        }
                     text = doc.text[args.start : args.start + args.length]
                     return {
                         "source_id": args.source_id,
                         "start": args.start,
+                        "end": args.start + len(text),
                         "text": text,
                         "total_chars": len(doc.text),
                         "has_more": args.start + len(text) < len(doc.text),
@@ -600,7 +650,11 @@ class ResearchEngine:
 
                 try:
                     result = await self.gateway.tool(
-                        "retrieve" if name == "search_sources" else name if name in TOOL_MODELS else "invalid_tool",
+                        "retrieve"
+                        if name == "search_sources"
+                        else name
+                        if name in TOOL_MODELS
+                        else "invalid_tool",
                         key,
                         operation,
                         task.id,
@@ -611,17 +665,37 @@ class ResearchEngine:
                         candidates.update(r["url"] for r in result["results"] if r.get("url"))
                         if name == "search_sources":
                             for hit in result["results"]:
-                                if not any(old.get("chunk_id") == hit.get("chunk_id") for old in retrieval_hits):
+                                if not any(
+                                    old.get("chunk_id") == hit.get("chunk_id") for old in retrieval_hits
+                                ):
                                     retrieval_hits.append(hit)
                     if name == "search_sources" and result.get("fallback"):
+                        unresolved.append("search_sources: fallback:" + result["fallback"])
                         await self.put(
                             "warning",
                             key + ":retrieval-fallback",
                             {"task_id": task.id, "reason": result["fallback"]},
                         )
                     if "text" in result:
-                        if result not in slices:
-                            slices.append(result)
+                        ranges = [
+                            (item["start"], item["start"] + len(item["text"]))
+                            for item in slices
+                            if item["source_id"] == result["source_id"]
+                        ] + [(result["start"], result["start"] + len(result["text"]))]
+                        merged = merge_read_ranges(ranges)
+                        slices = [item for item in slices if item["source_id"] != result["source_id"]]
+                        _, doc = await self.evidence.document(result["source_id"])
+                        slices.extend(
+                            {
+                                "source_id": result["source_id"],
+                                "start": start,
+                                "end": end,
+                                "text": doc.text[start:end],
+                                "total_chars": len(doc.text),
+                                "has_more": end < len(doc.text),
+                            }
+                            for start, end in merged
+                        )
                 except BudgetExceeded as exc:
                     # Keep tool message pairing and all earlier reads, even if a burst exceeds quota.
                     result = {
@@ -641,13 +715,46 @@ class ResearchEngine:
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
+                outcomes.append(
+                    {
+                        "tool": name,
+                        "ok": "error" not in result,
+                        "source_id": result.get("source_id"),
+                        "result_count": len(result.get("results", [])),
+                        "error": result.get("error"),
+                        "fallback": result.get("fallback"),
+                    }
+                )
+            progress.authorized_source_ids = sorted(sources)
+            progress.candidate_urls = sorted(candidates)
+            progress.read_ranges = {
+                source_id: merge_read_ranges(
+                    [
+                        (item["start"], item["start"] + len(item["text"]))
+                        for item in slices
+                        if item["source_id"] == source_id
+                    ]
+                )
+                for source_id in sorted(sources)
+            }
+            progress.retrieval_hits = retrieval_hits[-24:]
+            progress.unresolved = list(dict.fromkeys(unresolved))[-24:]
+            progress.last_tool_outcomes = outcomes[-8:]
+            after_signal = progress_signal(progress)
+            progress.no_gain_rounds = progress.no_gain_rounds + 1 if after_signal == before_signal else 0
+            progress.signal = after_signal
+            if not tool_protocol_closed(messages):
+                raise ValueError("unclosed_tool_protocol")
             return {
-                "messages": messages,
+                # The assistant/tool envelope was kept intact through this batch. It
+                # is now closed, so the next turn is rebuilt from the capsule.
+                "messages": [],
                 "source_ids": sorted(sources),
                 "read_slices": slices,
                 "retrieval_hits": retrieval_hits,
                 "unresolved": unresolved,
                 "candidate_urls": sorted(candidates),
+                "progress": progress.model_dump(mode="json"),
             }
 
         async def extract(state):
@@ -728,16 +835,28 @@ class ResearchEngine:
     async def research(self, state):
         await self.phase("research", gap_round=state.get("gap_round", 0))
         tasks = [ResearchTask.model_validate(t) for t in state["tasks"]]
-        complete = set()
+        finished: set[str] = set()
+        succeeded: set[str] = set()
+        failed: set[str] = set()
+        research_budget_stop: str | None = None
         for task in tasks:
             saved = await self.db.get(self.tenant, task.id, "task")
             task.execution_status = saved["execution_status"]
-            if task.execution_status in {"completed", "failed"}:
-                complete.add(task.id)
+            if task.execution_status in {"completed", "failed", "cancelled"}:
+                finished.add(task.id)
+                (succeeded if task.execution_status == "completed" else failed).add(task.id)
         semaphore = asyncio.Semaphore(self.profile.concurrency if self.profile.variant != "B0" else 1)
 
         async def run_task(task):
+            nonlocal research_budget_stop
             async with semaphore:
+                if research_budget_stop:
+                    task.execution_status = "cancelled"
+                    task.stop_reason = "deferred_after_" + research_budget_stop
+                    await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+                    finished.add(task.id)
+                    failed.add(task.id)
+                    return
                 task.execution_status = "running"
                 await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
                 graph = self.researcher_graph()
@@ -764,78 +883,182 @@ class ResearchEngine:
                 ]
                 inherited_sources = {span["source_id"] for span in dependency_spans}
                 authorized_sources = sorted(set(task.source_ids) | inherited_sources)
-                retrieval = {"results": [], "strategy": "sequential", "fallback": None}
-                if (
-                    not existing.values
-                    and authorized_sources
-                    and self.profile.retrieval_strategy != "sequential"
-                ):
-
-                    async def initial_retrieval():
-                        return await self.evidence.search(
-                            authorized_sources,
-                            task.query + "\n" + task.objective,
-                            self.profile.retrieval_strategy,
-                            8,
-                            0 if self.mode == "fixture" else self.db.settings.index_wait_seconds,
-                        )
-
-                    retrieval = await self.gateway.tool(
-                        "retrieve", f"{task.id}:retrieve:initial", initial_retrieval, task.id
-                    )
-                    if self.db.settings.retrieval_shadow:
-                        await self.put(
-                            "retrieval_shadow",
-                            f"{task.id}:retrieval-shadow",
-                            {"task_id": task.id, **retrieval},
-                        )
-                        retrieval = {**retrieval, "results": []}
-                    if retrieval.get("fallback"):
-                        await self.put(
-                            "warning",
-                            f"{task.id}:retrieval-fallback",
-                            {"task_id": task.id, "reason": retrieval["fallback"]},
-                        )
-                initial = (
-                    None
-                    if existing.values
-                    else {
-                        "task": task.model_dump(mode="json"),
-                        "dependency_context": {
-                            "claims": dependency_claims,
-                            "spans": dependency_spans,
-                            "findings": dependency_findings,
-                            "note": "Unreviewed prior-module evidence; re-read original sources before extending claims.",
-                        },
-                        "messages": [],
-                        "source_ids": authorized_sources,
-                        "read_slices": [],
-                        "retrieval_hits": retrieval.get("results", []),
-                        "iteration": 0,
-                        "unresolved": [],
-                    }
-                )
                 try:
+                    retrieval = {"results": [], "strategy": "sequential", "fallback": None}
+                    if (
+                        not existing.values
+                        and authorized_sources
+                        and self.profile.retrieval_strategy != "sequential"
+                    ):
+                        current = await self.db.run(self.tenant, self.run_id)
+                        if int(current["retrieval_calls"]) >= self.profile.max_retrieval_calls:
+                            retrieval["fallback"] = "retrieval_budget_exhausted"
+                        else:
+
+                            async def initial_retrieval():
+                                return await self.evidence.search(
+                                    authorized_sources,
+                                    task.query + "\n" + task.objective,
+                                    self.profile.retrieval_strategy,
+                                    8,
+                                    0 if self.mode == "fixture" else self.db.settings.index_wait_seconds,
+                                )
+
+                            try:
+                                retrieval = await self.gateway.tool(
+                                    "retrieve", f"{task.id}:retrieve:initial", initial_retrieval, task.id
+                                )
+                            except BudgetExceeded as exc:
+                                # A racing task may consume the last global retrieval
+                                # reservation after the check above. Retrieval quota is
+                                # tool-local: continue with authorized sources instead
+                                # of terminating the research run.
+                                if str(exc) != "retrieval_calls":
+                                    raise
+                                retrieval["fallback"] = "retrieval_budget_exhausted"
+                        if self.db.settings.retrieval_shadow:
+                            await self.put(
+                                "retrieval_shadow",
+                                f"{task.id}:retrieval-shadow",
+                                {"task_id": task.id, **retrieval},
+                            )
+                            retrieval = {**retrieval, "results": []}
+                        if retrieval.get("fallback"):
+                            await self.put(
+                                "warning",
+                                f"{task.id}:retrieval-fallback",
+                                {"task_id": task.id, "reason": retrieval["fallback"]},
+                            )
+                    initial_unresolved = (
+                        ["search_sources: fallback:" + retrieval["fallback"]]
+                        if retrieval.get("fallback")
+                        else []
+                    )
+                    initial = (
+                        None
+                        if existing.values
+                        else {
+                            "task": task.model_dump(mode="json"),
+                            "dependency_context": {
+                                "claims": [
+                                    {
+                                        "id": claim["id"],
+                                        "text": claim["text"],
+                                        "span_ids": claim["span_ids"],
+                                        "stance": claim["stance"],
+                                    }
+                                    for claim in dependency_claims
+                                ],
+                                "spans": [
+                                    {
+                                        "id": span["id"],
+                                        "source_id": span["source_id"],
+                                        "start": span["start"],
+                                        "end": span["end"],
+                                    }
+                                    for span in dependency_spans
+                                ],
+                                "findings": [
+                                    {
+                                        "task_id": finding["task_id"],
+                                        "summary": finding["summary"],
+                                        "unresolved": finding["unresolved"],
+                                    }
+                                    for finding in dependency_findings
+                                ],
+                                "note": "Unreviewed prior-module evidence; re-read original sources before extending claims.",
+                            },
+                            "messages": [],
+                            "source_ids": authorized_sources,
+                            "read_slices": [],
+                            "retrieval_hits": retrieval.get("results", []),
+                            "iteration": 0,
+                            "unresolved": initial_unresolved,
+                            "progress": ResearchProgress(
+                                authorized_source_ids=authorized_sources,
+                                candidate_urls=list(self.brief.source_urls),
+                                retrieval_hits=retrieval.get("results", []),
+                                acceptance_coverage=[],
+                                unresolved=initial_unresolved,
+                                last_tool_outcomes=(
+                                    [
+                                        {
+                                            "tool": "search_sources",
+                                            "ok": True,
+                                            "result_count": len(retrieval.get("results", [])),
+                                            "fallback": retrieval["fallback"],
+                                        }
+                                    ]
+                                    if retrieval.get("fallback")
+                                    else []
+                                ),
+                            ).model_dump(mode="json"),
+                        }
+                    )
                     await graph.ainvoke(initial, config)
                     # A crash between child END and parent commit can replay this branch.
                     saved = await self.db.get(self.tenant, task.id, "task")
                     if saved["execution_status"] == "running":
                         saved["execution_status"] = "completed"
                         await self.put("task", task.id, saved, immutable=False)
-                except (BudgetExceeded, ProviderError, ValueError) as exc:
+                except BudgetExceeded as exc:
                     task.execution_status, task.stop_reason = (
                         "failed",
                         type(exc).__name__ + ":" + str(exc)[:160],
                     )
                     await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
-                complete.add(task.id)
+                    research_budget_stop = "budget:" + str(exc)
+                    await self.db.emit_event(
+                        self.tenant,
+                        self.run_id,
+                        "research.budget_exhausted",
+                        {"task_id": task.id, "reason": research_budget_stop},
+                    )
+                    failed.add(task.id)
+                except (ProviderError, ValueError) as exc:
+                    task.execution_status, task.stop_reason = (
+                        "failed",
+                        type(exc).__name__ + ":" + str(exc)[:160],
+                    )
+                    await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+                    failed.add(task.id)
+                else:
+                    succeeded.add(task.id)
+                finished.add(task.id)
 
-        while len(complete) < len(tasks):
-            ready = [t for t in tasks if t.id not in complete and set(t.depends_on) <= complete]
+        while len(finished) < len(tasks):
+            if research_budget_stop:
+                for task in tasks:
+                    if task.id in finished:
+                        continue
+                    task.execution_status = "cancelled"
+                    task.stop_reason = "deferred_after_" + research_budget_stop
+                    await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+                    finished.add(task.id)
+                    failed.add(task.id)
+                break
+            blocked = [task for task in tasks if task.id not in finished and set(task.depends_on) & failed]
+            for task in blocked:
+                task.execution_status = "cancelled"
+                task.stop_reason = "dependency_failed"
+                await self.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+                finished.add(task.id)
+                failed.add(task.id)
+            ready = [task for task in tasks if task.id not in finished and set(task.depends_on) <= succeeded]
             if not ready:
+                if len(finished) == len(tasks):
+                    break
                 raise ValueError("unschedulable_plan")
             await asyncio.gather(*(run_task(t) for t in ready))
-        return {"tasks": await self.db.records(self.tenant, self.run_id, "task")}
+        result = {"tasks": await self.db.records(self.tenant, self.run_id, "task")}
+        if research_budget_stop:
+            result.update(
+                {
+                    "stop_reason": research_budget_stop,
+                    "research_budget_exhausted": True,
+                }
+            )
+        return result
 
     async def review(self, state):
         await self.phase("review", gap_round=state.get("gap_round", 0))
@@ -855,10 +1078,21 @@ class ResearchEngine:
             cited_spans = {s for c in claims for s in c["span_ids"]}
             spans = [s for s in spans if s["id"] in cited_spans]
         question_ids = [t["question_id"] for t in state["plan"]["tasks"]]
+        intent_data = state.get("intent") or state.get("plan", {}).get("intent")
+        intent = ResearchIntent.model_validate(intent_data) if intent_data else None
+        allowed_methods = (
+            {
+                decision.stage.value: [method.value for method in decision.methods]
+                for decision in intent.stages
+            }
+            if intent
+            else {}
+        )
         payload = {
             "role": "reviewer",
             "brief": self.brief.model_dump(mode="json"),
             "research_intent": state.get("intent") or state.get("plan", {}).get("intent"),
+            "allowed_gap_methods_by_stage": allowed_methods,
             "claims": claims,
             "spans": spans,
             "question_ids": question_ids,
@@ -900,9 +1134,95 @@ class ResearchEngine:
         }
         key = f"review:g{state.get('gap_round', 0)}:r{state.get('revision', 0)}"
         payload = await self.evidence_context("reviewer", key, payload)
-        review = Review.model_validate(
-            await self.gateway.structured("reviewer", key, payload, Review, closing=True)
-        )
+        review_budget_stop = None
+        try:
+            review = Review.model_validate(
+                await self.gateway.structured("reviewer", key, payload, Review, closing=True)
+            )
+        except BudgetExceeded as exc:
+            # Independent review is preferable, but exhausting its reservation
+            # must not make the already-collected evidence unreachable to Writer.
+            # Exact-span extraction has already run; expose those claims as
+            # provisional and force needs_review at publication.
+            review_budget_stop = "budget:" + str(exc)
+            visible_claims = payload.get("claims", [])
+            visible_task_ids = {claim["task_id"] for claim in visible_claims}
+            review = Review(
+                sufficient=False,
+                accepted_claim_ids=[claim["id"] for claim in visible_claims],
+                covered_question_ids=[
+                    task["question_id"] for task in state["tasks"] if task["id"] in visible_task_ids
+                ],
+                findings=[
+                    ReviewFinding(
+                        id=stable_id(self.run_id, key, "budget-review"),
+                        location="review",
+                        severity="warning",
+                        category="coverage",
+                        reason=f"Independent review was curtailed by {review_budget_stop}; exact-span claims are provisional.",
+                        suggestion="Use the provisional evidence in a bounded report and disclose missing coverage.",
+                    )
+                ],
+            )
+            await self.db.emit_event(
+                self.tenant,
+                self.run_id,
+                "review.degraded",
+                {"reason": review_budget_stop, "provisional_claims": len(visible_claims)},
+            )
+        level = await self.budget_level()
+        valid_gap_tasks = []
+        for gap_task in review.gap_tasks:
+            stage = gap_task.stage.value
+            method = gap_task.method.value
+            reason = None
+            if stage not in allowed_methods or method not in allowed_methods[stage]:
+                reason = "gap_task_outside_research_intent"
+            elif state.get("research_budget_exhausted") or review_budget_stop:
+                reason = "research_budget_exhausted"
+            elif level >= 95:
+                reason = "soft_token_95_threshold"
+            if reason is None:
+                valid_gap_tasks.append(gap_task)
+                continue
+            review.sufficient = False
+            review.findings.append(
+                ReviewFinding(
+                    id=stable_id(self.run_id, key, "gap-rejected", gap_task.id),
+                    location="review.gap_tasks",
+                    severity="warning",
+                    category="instruction",
+                    reason=f"Rejected gap task {gap_task.id}: {reason} ({stage}/{method}).",
+                    suggestion="Resolve the disclosed evidence gap in a new run or revise the frozen research intent.",
+                )
+            )
+            await self.db.emit_event(
+                self.tenant,
+                self.run_id,
+                "review.gap_rejected",
+                {
+                    "task_id": gap_task.id,
+                    "stage": stage,
+                    "method": method,
+                    "allowed_methods": allowed_methods.get(stage, []),
+                    "reason": reason,
+                },
+            )
+        review.gap_tasks = valid_gap_tasks
+        if state.get("research_budget_exhausted"):
+            review.sufficient = False
+            budget_finding_id = stable_id(self.run_id, key, "budget-coverage")
+            if not any(finding.id == budget_finding_id for finding in review.findings):
+                review.findings.append(
+                    ReviewFinding(
+                        id=budget_finding_id,
+                        location="research",
+                        severity="warning",
+                        category="coverage",
+                        reason="Research stopped at its budget boundary; one or more planned deliverables remain incomplete.",
+                        suggestion="Write a bounded report from accepted evidence and disclose every deferred task.",
+                    )
+                )
         known = {c["id"] for c in claims}
         visible = {c["id"] for c in payload["claims"]}
         if not set(review.accepted_claim_ids) <= known:
@@ -933,13 +1253,9 @@ class ResearchEngine:
                 location = next((n for n in locations if error.startswith(n + ":")), None)
                 if not location and error.startswith("paper ") and state["report"].get("paper"):
                     location = "paper"
-                if not location and error.startswith("introduction:") and state["report"].get(
-                    "introduction"
-                ):
+                if not location and error.startswith("introduction:") and state["report"].get("introduction"):
                     location = "introduction"
-                if not location and error.startswith("experiments:") and state["report"].get(
-                    "experiments"
-                ):
+                if not location and error.startswith("experiments:") and state["report"].get("experiments"):
                     location = "experiments"
                 if location:
                     grouped.setdefault(location, []).append(error)
@@ -982,21 +1298,33 @@ class ResearchEngine:
                 ),
             }
         )
-        return {
+        result = {
             "review": review.model_dump(mode="json"),
             "previous_claims": unique_evidence,
             "previous_signal": signal,
             "no_gain": state.get("gap_round", 0) > 0 and state.get("previous_signal") == signal,
+            "degradation_level": level,
         }
+        if review_budget_stop and not state.get("stop_reason"):
+            result.update(
+                {
+                    "stop_reason": review_budget_stop,
+                    "research_budget_exhausted": True,
+                }
+            )
+        return result
 
     def route_review(self, state):
         review = state["review"]
+        if state.get("research_budget_exhausted") or str(state.get("stop_reason", "")).startswith("budget:"):
+            return "publish" if state.get("report") else "write"
         if (
             self.profile.variant == "B2"
             and review["gap_tasks"]
             and not state.get("no_gain")
             and state.get("gap_round", 0) < self.profile.max_gap_rounds
             and len(state["tasks"]) < self.profile.max_tasks
+            and state.get("degradation_level", 0) < 95
         ):
             return "gaps"
         if not state.get("report"):
@@ -1005,6 +1333,11 @@ class ResearchEngine:
         if errors and state.get("patch_round", 0) < self.profile.max_patch_rounds:
             return "patch"
         return "publish"
+
+    def route_write(self, state):
+        if state.get("research_budget_exhausted") or str(state.get("stop_reason", "")).startswith("budget:"):
+            return "publish"
+        return "review"
 
     async def gaps(self, state):
         tasks = list(state["tasks"])
@@ -1018,7 +1351,21 @@ class ResearchEngine:
         for proposal in proposals:
             t = ResearchTask.model_validate(proposal)
             if t.stage not in decisions or t.method not in decisions[t.stage].methods:
-                raise ValueError("gap_task_outside_research_intent")
+                await self.db.emit_event(
+                    self.tenant,
+                    self.run_id,
+                    "review.gap_rejected",
+                    {
+                        "task_id": t.id,
+                        "stage": t.stage.value,
+                        "method": t.method.value,
+                        "allowed_methods": [m.value for m in decisions.get(t.stage, intent.stages[0]).methods]
+                        if decisions
+                        else [],
+                        "reason": "gap_task_outside_research_intent_defensive_gate",
+                    },
+                )
+                continue
             t.output_role = decisions[t.stage].role
             t.id = mapping[t.id]
             # Reviewer may reference existing tasks, but cannot introduce cycles or hidden dependencies.
@@ -1032,6 +1379,90 @@ class ResearchEngine:
             "gap_round": state["gap_round"] + 1,
             "pending_patch_findings": state["review"]["findings"] if state.get("report") else [],
         }
+
+    async def degraded_report(self, state, reason: str) -> ReportDraft:
+        """Build a useful, auditable report without another model reservation.
+
+        This is the last line of defence for a closing-stage budget failure. It
+        synthesizes task findings rather than dumping arbitrary claims in storage
+        order, and makes every missing deliverable explicit.
+        """
+        tasks = state.get("tasks") or await self.db.records(self.tenant, self.run_id, "task")
+        findings = await self.db.records(self.tenant, self.run_id, "finding")
+        finding_by_task = {finding["task_id"]: finding for finding in findings}
+        accepted = set(state.get("review", {}).get("accepted_claim_ids", []))
+        completed = sum(task.get("execution_status") == "completed" for task in tasks)
+        nodes = [
+            ReportNode(
+                id="research-status",
+                kind="section",
+                title="研究状态与可用结论",
+                text=(
+                    f"本次研究在预算保护下提前收口：{len(tasks)} 个任务中完成 {completed} 个。"
+                    "以下内容按原定交付模块整理；未完成部分明确标为待验证，不代表研究目标已经满足。"
+                ),
+                attribution="guidance",
+                output_mode="guidance",
+            )
+        ]
+        unresolved = [reason]
+        output_modes = {
+            ResearchStage.METHODOLOGY.value: "research_proposal",
+            ResearchStage.EXPERIMENT.value: "experiment_plan",
+        }
+        for task in tasks:
+            if task.get("output_role") != "deliverable":
+                continue
+            finding = finding_by_task.get(task["id"])
+            claim_ids = [cid for cid in (finding or {}).get("claim_ids", []) if cid in accepted]
+            if finding and finding.get("summary") and claim_ids:
+                text = finding["summary"]
+                attribution = "source_statement"
+            else:
+                criteria = "；".join(task.get("acceptance_criteria", [])) or "原定验收条件"
+                text = (
+                    f"该模块未形成经过独立审查的完整交付物。原定目标：{task.get('deliverable', task['objective'])}。"
+                    f"仍需完成：{criteria}。"
+                )
+                attribution = "guidance"
+            nodes.append(
+                ReportNode(
+                    id="degraded-" + task["id"],
+                    kind="section",
+                    title=task.get("deliverable") or task["objective"],
+                    text=text,
+                    claim_ids=claim_ids,
+                    attribution=attribution,
+                    stage=task.get("stage"),
+                    output_mode=output_modes.get(task.get("stage"), "evidence_synthesis"),
+                    execution_status=(
+                        "not_executed"
+                        if task.get("stage") in {"methodology", "experiment"}
+                        else "not_applicable"
+                    ),
+                )
+            )
+            if task.get("stop_reason"):
+                unresolved.append(f"{task.get('stage', 'task')}: {task['stop_reason']}")
+            unresolved.extend((finding or {}).get("unresolved", []))
+        nodes.append(
+            ReportNode(
+                id="next-run-boundary",
+                kind="section",
+                title="下一步验证边界",
+                text=(
+                    "优先补齐标记为未完成的交付模块，并复核 provisional evidence；在这些缺口解决前，"
+                    "不得把当前内容解释为完整方案、复现实验结果或优越性结论。"
+                ),
+                attribution="guidance",
+                output_mode="guidance",
+            )
+        )
+        return ReportDraft(
+            title="阶段性研究报告",
+            nodes=nodes[:8],
+            unresolved=list(dict.fromkeys(unresolved))[:40],
+        )
 
     async def write(self, state):
         if state.get("report"):
@@ -1070,9 +1501,26 @@ class ResearchEngine:
             " at most 8 nodes, under 4000 Chinese characters of prose. Do not repeat the evidence appendix in report prose."
         )
         payload = await self.evidence_context("writer", "draft", payload)
-        report = ReportDraft.model_validate(
-            await self.gateway.structured("writer", "draft", payload, ReportDraft, closing=True)
-        )
+        try:
+            report = ReportDraft.model_validate(
+                await self.gateway.structured("writer", "draft", payload, ReportDraft, closing=True)
+            )
+        except BudgetExceeded as exc:
+            reason = state.get("stop_reason") or "budget:" + str(exc)
+            report = await self.degraded_report(state, reason)
+            await self.db.emit_event(
+                self.tenant,
+                self.run_id,
+                "writer.degraded",
+                {"reason": "budget:" + str(exc), "nodes": len(report.nodes)},
+            )
+            await self.put("draft", self.run_id + ":draft:1", report.model_dump(mode="json"))
+            return {
+                "report": report.model_dump(mode="json"),
+                "revision": 1,
+                "stop_reason": reason,
+                "research_budget_exhausted": True,
+            }
         await self.put("draft", self.run_id + ":draft:1", report.model_dump(mode="json"))
         return {"report": report.model_dump(mode="json"), "revision": 1}
 
@@ -1204,9 +1652,7 @@ class ResearchEngine:
                     errors.append(node.id + ": experiment result is not marked executed")
                 if node.execution_status == "executed" and node.output_mode != "experiment_result":
                     errors.append(node.id + ": executed status requires an experiment result")
-            selected = {
-                decision.stage for decision in intent.stages if decision.role == "deliverable"
-            }
+            selected = {decision.stage for decision in intent.stages if decision.role == "deliverable"}
             if ResearchStage.INTRODUCTION in selected and report.introduction is None:
                 errors.append("introduction: structured argument missing")
             if ResearchStage.EXPERIMENT in selected and not report.experiments:
@@ -1247,9 +1693,10 @@ class ResearchEngine:
         if not review.get("sufficient") or any(f["severity"] == "error" for f in review.get("findings", [])):
             errors.append("review coverage/support requirements unresolved")
         if any(
-            t["execution_status"] == "failed" for t in await self.db.records(self.tenant, self.run_id, "task")
+            t["execution_status"] in {"failed", "cancelled"}
+            for t in await self.db.records(self.tenant, self.run_id, "task")
         ):
-            errors.append("one or more research tasks failed")
+            errors.append("one or more research tasks failed or were deferred")
         return report, claims, spans, sources, errors
 
     async def publish(self, state):
@@ -1295,7 +1742,9 @@ class ResearchEngine:
         await self.put(
             "report", self.run_id + f":report:{state['revision']}", package.model_dump(mode="json")
         )
-        return {"stop_reason": "quality_passed" if not errors else "needs_review"}
+        return {
+            "stop_reason": state.get("stop_reason") or ("quality_passed" if not errors else "needs_review")
+        }
 
     def graph(self):
         graph = StateGraph(ResearchState)
@@ -1318,7 +1767,7 @@ class ResearchEngine:
         graph.add_edge("research", "review")
         graph.add_conditional_edges("review", self.route_review)
         graph.add_edge("gaps", "research")
-        graph.add_edge("write", "review")
+        graph.add_conditional_edges("write", self.route_write)
         graph.add_edge("patch", "review")
         graph.add_edge("publish", END)
         return graph.compile(checkpointer=self.saver)
@@ -1330,22 +1779,41 @@ class ResearchEngine:
         return await graph.ainvoke(None if snapshot.values else {}, config)
 
     async def partial(self, reason: str):
-        claims = [Claim.model_validate(c) for c in await self.claims()]
-        nodes = [
-            ReportNode(
-                id="partial",
-                kind="section",
-                title="Partial research package",
-                text="研究因资源或执行限制提前结束；以下为已保存的来源陈述，尚未完成综合核验。",
-                attribution="guidance",
-            )
-        ]
-        nodes += [ReportNode(id=c.id, kind="paragraph", text=c.text, claim_ids=[c.id]) for c in claims[:30]]
-        state = {
-            "report": ReportDraft(title="Partial research", nodes=nodes, unresolved=[reason]).model_dump(
-                mode="json"
+        claims = await self.claims()
+        tasks = await self.db.records(self.tenant, self.run_id, "task")
+        plans = await self.db.records(self.tenant, self.run_id, "plan")
+        intents = await self.db.records(self.tenant, self.run_id, "intent")
+        review = Review(
+            sufficient=False,
+            accepted_claim_ids=[claim["id"] for claim in claims],
+            covered_question_ids=list(
+                dict.fromkeys(
+                    task["question_id"]
+                    for task in tasks
+                    if any(claim["task_id"] == task["id"] for claim in claims)
+                )
             ),
+            findings=[
+                ReviewFinding(
+                    id=stable_id(self.run_id, "terminal-partial", reason),
+                    location="run",
+                    severity="warning",
+                    category="coverage",
+                    reason="The normal workflow terminated before independent review: " + reason,
+                    suggestion="Treat all retained claims as provisional and complete the deferred modules in a new run.",
+                )
+            ],
+        )
+        state = {
+            "tasks": tasks,
+            "review": review.model_dump(mode="json"),
+            "stop_reason": reason if reason.startswith("budget:") else "terminal:" + reason,
+            "research_budget_exhausted": reason.startswith("budget:"),
             "revision": 999,
-            "review": {"sufficient": False, "findings": []},
         }
+        if plans:
+            state["plan"] = plans[-1]
+        if intents:
+            state["intent"] = intents[-1]
+        state["report"] = (await self.degraded_report(state, reason)).model_dump(mode="json")
         await self.publish(state)

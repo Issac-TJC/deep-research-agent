@@ -1,0 +1,38 @@
+{
+  "brief": {
+    "question": "我想做一个用 prompt 构建 3D 真实场景、并通过 3D Gaussian Splatting 快速编辑的项目。请梳理现有方案，提出可在其基础上优化的方法，并设计能验证方案优势的数据集、基线、指标和测试协议。",
+    "template": "general_research",
+    "language": "zh",
+    "constraints": [
+      "优先论文和项目官方来源，并明确区分作者结论、系统推断与研究假设。",
+      "不得声称执行了代码或实验；没有同条件数据时标为未知。",
+      "覆盖 prompt 驱动的场景生成、3DGS 编辑、数据集、基线、指标和可复现测试方案。"
+    ]
+  },
+  "profile": {
+    "name": "v1-quality-180k",
+    "variant": "B2",
+    "concurrency": 3,
+    "max_tasks": 8,
+    "max_gap_rounds": 2,
+    "max_patch_rounds": 2,
+    "max_tool_calls": 80,
+    "max_task_tools": 12,
+    "max_search_calls": 12,
+    "max_task_search_calls": 3,
+    "max_model_calls": 40,
+    "max_tokens": 250000,
+    "prompt_token_limit": 64000,
+    "max_output_tokens": 32768,
+    "max_seconds": 1200,
+    "max_usd": 0.5,
+    "max_retries": 2,
+    "max_sources": 24,
+    "paper_related_sources": 3,
+    "context_strategy": "evidence",
+    "search_policy": "live",
+    "retrieval_strategy": "hybrid",
+    "max_retrieval_calls": 3,
+    "parser_mode": "auto"
+  }
+}

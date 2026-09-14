@@ -9,6 +9,12 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from research_agent.context import (
+    BUDGET_CUMULATIVE_CAPS,
+    BUDGET_GROUPS,
+    SOFT_TOKEN_TARGET,
+    degradation_level,
+)
 from research_agent.contracts import CreateRun, RunProfile, uid
 from research_agent.settings import Settings
 
@@ -97,6 +103,28 @@ class Database:
             "INSERT INTO run_events VALUES (%s,%s,%s,%s,%s,now())",
             (tenant, run_id, r["seq"], kind, Jsonb(payload)),
         )
+
+    async def emit_event(self, tenant: str, run_id: str, kind: str, payload: dict):
+        async with self.tx(tenant) as conn:
+            await self.event(conn, tenant, run_id, kind, payload)
+
+    async def record_degradation(self, tenant: str, run_id: str, level: int, reason: str):
+        async with self.tx(tenant) as conn:
+            exists = await (
+                await conn.execute(
+                    """SELECT 1 FROM run_events WHERE run_id=%s AND event_type='budget.degraded'
+                    AND payload->>'level'=%s LIMIT 1""",
+                    (run_id, str(level)),
+                )
+            ).fetchone()
+            if not exists:
+                await self.event(
+                    conn,
+                    tenant,
+                    run_id,
+                    "budget.degraded",
+                    {"level": level, "reason": reason, "soft_target": SOFT_TOKEN_TARGET},
+                )
 
     async def create_run(self, tenant: str, request: CreateRun, key: str) -> tuple[dict, bool]:
         payload = request.model_dump(mode="json")
@@ -581,12 +609,13 @@ class Database:
             has_lexical = bool(row and row["total_chunks"])
             should_retry = bool(retry and row and row["attempts"] < 3)
             status = "lexical_ready" if has_lexical else ("processing" if should_retry else "failed")
+            retry_delay = min(60, 10 * (2 ** max(0, int(row["attempts"]) - 1))) if row else 10
             await conn.execute(
                 """UPDATE source_index_jobs SET status=%s,error=%s,
-                lease_until=CASE WHEN %s THEN now()+interval '10 seconds' ELSE NULL END,
+                lease_until=CASE WHEN %s THEN now()+make_interval(secs=>%s) ELSE NULL END,
                 updated_at=now()
                 WHERE source_id=%s AND index_version=%s""",
-                (status, error[:300], should_retry, source_id, index_version),
+                (status, error[:300], should_retry, retry_delay, source_id, index_version),
             )
 
     async def chunk_rows(self, tenant: str, source_id: str, index_version: str) -> list[dict]:
@@ -686,6 +715,12 @@ class Database:
         tokens: int = 0,
         task_id: str | None = None,
         closing: bool = False,
+        role: str = "legacy",
+        budget_group: str = "legacy",
+        serialized_bytes: int = 0,
+        estimated_input_tokens: int = 0,
+        output_token_ceiling: int = 0,
+        request: dict | None = None,
     ):
         async with self.tx(tenant) as conn:
             r = await self.guard(conn, run_id, fence)
@@ -705,10 +740,28 @@ class Database:
             cap = p.max_usd * (1 if closing else 0.8)
             if float(r["spent_usd"] + r["reserved_usd"]) + usd > cap or elapsed["s"] > p.max_seconds:
                 raise BudgetExceeded("money_or_deadline")
-            token_cap = p.max_tokens if closing else int(p.max_tokens * 0.8)
+            # Reserve the estimated input plus the largest permitted output. Actual
+            # provider usage is settled separately and remains the source of truth.
+            token_cap = p.max_tokens
             model_cap = p.max_model_calls if closing else max(1, int(p.max_model_calls * 0.8))
             if r["tokens"] + r["reserved_tokens"] + tokens > token_cap:
                 raise BudgetExceeded("tokens")
+            soft_order = ["scope_plan", "research_extraction", "review_gap", "writer_patch"]
+            if kind == "model" and budget_group in soft_order:
+                position = soft_order.index(budget_group)
+                allowed_groups = soft_order[: position + 1]
+                cumulative_caps = [BUDGET_CUMULATIVE_CAPS[group] for group in soft_order]
+                used = await (
+                    await conn.execute(
+                        """SELECT coalesce(sum(CASE WHEN status IN ('reserved','unknown') THEN
+                        reserved_tokens ELSE coalesce((usage->>'input_tokens')::bigint,0)
+                        +coalesce((usage->>'output_tokens')::bigint,0) END),0) AS tokens
+                        FROM actions WHERE run_id=%s AND budget_group=ANY(%s)""",
+                        (run_id, allowed_groups),
+                    )
+                ).fetchone()
+                if int(used["tokens"]) + tokens > cumulative_caps[position]:
+                    raise BudgetExceeded("soft_target:" + budget_group)
             if kind == "model" and r["model_calls"] >= model_cap:
                 raise BudgetExceeded("model_calls")
             if kind != "model" and r["tool_calls"] >= p.max_tool_calls:
@@ -762,9 +815,14 @@ class Database:
                 ),
             )
             await conn.execute(
-                """INSERT INTO actions(tenant_id,run_id,id,task_id,kind,status,reserved_usd,reserved_tokens)
-                VALUES (%s,%s,%s,%s,%s,'reserved',%s,%s)""",
-                (tenant, run_id, action_id, task_id, kind, usd, tokens),
+                """INSERT INTO actions
+                (tenant_id,run_id,id,task_id,kind,status,reserved_usd,reserved_tokens,role,budget_group,
+                 serialized_bytes,estimated_input_tokens,output_token_ceiling,request)
+                VALUES (%s,%s,%s,%s,%s,'reserved',%s,%s,%s,%s,%s,%s,%s,%s)""",
+                (
+                    tenant, run_id, action_id, task_id, kind, usd, tokens, role, budget_group,
+                    serialized_bytes, estimated_input_tokens, output_token_ceiling, Jsonb(request),
+                ),
             )
             await self.event(
                 conn, tenant, run_id, "action.reserved", {"id": action_id, "kind": kind, "task_id": task_id}
@@ -827,6 +885,81 @@ class Database:
                     (run_id,),
                 )
             ).fetchall()
+
+    async def usage_summary(self, tenant: str, run_id: str) -> dict:
+        async with self.tx(tenant) as conn:
+            run = await (
+                await conn.execute(
+                    """SELECT tokens,reserved_tokens,spent_usd,reserved_usd,profile
+                    FROM research_runs WHERE id=%s""",
+                    (run_id,),
+                )
+            ).fetchone()
+            if not run:
+                raise NotFound(run_id)
+            rows = await (
+                await conn.execute(
+                    """SELECT budget_group,
+                    coalesce(sum((usage->>'input_tokens')::bigint),0) AS input_tokens,
+                    coalesce(sum((usage->>'output_tokens')::bigint),0) AS output_tokens,
+                    coalesce(sum((usage->>'cache_hit_tokens')::bigint),0) AS cache_hit_tokens,
+                    count(*) FILTER (WHERE kind='model') AS model_calls,
+                    count(*) FILTER (WHERE kind!='model') AS tool_calls,
+                    coalesce(sum((usage->>'usd')::numeric),0) AS usd,
+                    coalesce(sum(estimated_input_tokens),0) AS estimated_input_tokens,
+                    coalesce(sum(serialized_bytes),0) AS serialized_bytes
+                    FROM actions WHERE run_id=%s GROUP BY budget_group ORDER BY budget_group""",
+                    (run_id,),
+                )
+            ).fetchall()
+            events = await (
+                await conn.execute(
+                    """SELECT seq,payload,occurred_at FROM run_events
+                    WHERE run_id=%s AND event_type='budget.degraded' ORDER BY seq""",
+                    (run_id,),
+                )
+            ).fetchall()
+            groups = {
+                name: {
+                    "target": target,
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_hit_tokens": 0,
+                    "model_calls": 0,
+                    "tool_calls": 0,
+                    "usd": 0.0,
+                    "estimated_input_tokens": 0,
+                    "serialized_bytes": 0,
+                }
+                for name, target in BUDGET_GROUPS.items()
+            }
+            for row in rows:
+                group = row["budget_group"] or "legacy"
+                groups.setdefault(group, {"target": 0})
+                groups[group].update(
+                    {
+                        key: float(value) if key == "usd" else int(value)
+                        for key, value in row.items()
+                        if key != "budget_group"
+                    }
+                )
+            actual = int(run["tokens"])
+            hard = int(RunProfile.model_validate(run["profile"]).max_tokens)
+            return {
+                "totals": {
+                    "tokens": actual,
+                    "reserved_tokens": int(run["reserved_tokens"]),
+                    "usd": float(run["spent_usd"]),
+                    "reserved_usd": float(run["reserved_usd"]),
+                },
+                "soft_target": SOFT_TOKEN_TARGET,
+                "hard_cap": hard,
+                "soft_remaining": max(0, SOFT_TOKEN_TARGET - actual),
+                "hard_remaining": max(0, hard - actual - int(run["reserved_tokens"])),
+                "degradation_level": degradation_level(actual),
+                "budget_groups": groups,
+                "degradation_events": [dict(row) for row in events],
+            }
 
     async def attach_source(self, tenant: str, run_id: str, fence: int, source: dict, related=False):
         async with self.tx(tenant) as conn:

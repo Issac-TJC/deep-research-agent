@@ -826,3 +826,19 @@ th {
   border: 1px solid var(--line);
   background: #fff;
 }
+.usage-summary {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  margin-bottom: 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.usage-summary progress {
+  width: 100%;
+  accent-color: var(--accent);
+}
+.usage-summary small,
+.usage-summary span {
+  display: block;
+}

@@ -6,7 +6,7 @@
 
 - PostgreSQL 17 + pgvector 0.8.6：保存租户隔离的 chunk、全文索引、768 维向量和索引任务。
 - Indexer：用数据库租约异步解析上传、稳定分块、先提交词法索引，再批量写入 embedding。失败最多重试三次；向量失败保留 `lexical_ready`。
-- Embedding service：固定 `Alibaba-NLP/gte-multilingual-base@9bbca17`，CPU 默认四线程，检测到 CUDA 时自动使用 GPU；运行网络没有数据库、对象存储或供应商凭据。
+- Embedding service：固定 `Alibaba-NLP/gte-multilingual-base@9bbca17` 和动态模块 `Alibaba-NLP/new-impl@40ced75c3017eb27626c9d4ea981bde21a2662f4`。构建时把模块复制进模型目录并完成真实 768 维 warm-load；运行时只读、离线。`/health` 只有在短文本推理得到非零、归一化 768 维向量时才 ready。
 - Parser：固定 Docling 2.126.0，使用 RapidOCR（`zh-Hans,en`）、accurate TableFormer、公式、图片分类、图表抽取和 `SmolVLM-256M-Instruct@7e3e67e`。模型只在镜像构建时下载，运行时离线。
 
 ## 状态和接口
@@ -30,7 +30,7 @@ docker compose up -d indexer api worker web
 docker compose run --rm migrate research reindex --all
 ```
 
-重建使用新的 `index_version`，最后一个可用索引在新版本达到 `lexical_ready` 前继续服务。当前查询在至多 24 个授权来源内做精确 cosine，不创建 HNSW；只有基准的 p95 超过 1 秒后才应引入按租户分区的近似索引。
+重建使用新的 `index_version`，最后一个可用索引在新版本达到 `lexical_ready` 前继续服务。暂时性 429/502/503/504 或连接超时采用 1/2/4 秒有界退避，失败仍保留词法索引；服务恢复后用 `research reindex --all` 创建新版本，不覆盖旧可用版本。当前查询在至多 24 个授权来源内做精确 cosine，不创建 HNSW；只有基准的 p95 超过 1 秒后才应引入按租户分区的近似索引。
 
 冻结检索集使用 JSON 数组，每题包含 `id/query/source_ids/relevant[{source_id,start,end}]`，错误码或版本号题设置 `exact_identifier=true`。运行 `research retrieval-benchmark DATASET --enforce` 会比较 lexical、dense 和 hybrid，并执行 150 题、Recall@8、精确标识符、hybrid 不退化及 p95 门禁。
 

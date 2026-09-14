@@ -42,7 +42,7 @@ def configure():
     if _configured:
         return
     provider = TracerProvider(
-        resource=Resource.create({"service.name": "deep-research-agent", "service.version": "0.1.0"})
+        resource=Resource.create({"service.name": "deep-research-agent", "service.version": "0.2.0"})
     )
     if path := os.getenv("RESEARCH_TRACE_FILE"):
         provider.add_span_processor(SimpleSpanProcessor(MetadataExporter(path)))

@@ -1,6 +1,6 @@
 # 面试深挖：实现、真实问题与证据边界
 
-此文在核心功能实现后整理。开发过程的原始记录见 development-log。已完成多轮真实 DeepSeek/Tavily 联调并记录失败案例，逐轮结果见开发日志；本文不预填准确率、时延提升或多 Agent 收益。
+此文在核心功能实现后整理，当前对应 v0.2.0（2026-09-14）。开发过程的原始记录见 development-log。已完成多轮真实 DeepSeek/Tavily 联调并记录失败案例，逐轮结果见开发日志；本文不预填准确率、时延提升或多 Agent 收益。
 
 ## 1. 场景与项目价值
 
@@ -99,7 +99,70 @@ V1 工具少且静态提供，不存在海量动态工具检索模块，因而�
 - 运行工作流升级以代码指纹阻止混用，尚未提供任意版本状态迁移。
 - 测试租户 API Key、RLS 与私有工件不是完整 SSO／合规认证；孤立对象清理与未知费用自动对账后置。
 
-## 9. 如何演示而不夸大？
+## 9. v0.2.0：上次 pull 后的本地验证问题与修复
+
+本节以 Git 基线 `9bba9093278aae02f83db47b28da4c55af753407` 为边界，只记录 2026-09-13 晚间 pull 后实际遇到的问题。面试表达应按“现象 → 账本/事件证据 → 控制边界根因 → 修复 → 尚未证明什么”展开。
+
+### 审计补证抛 ValueError
+
+- **现象**：run `6816d735-e28c-408e-b70b-7a16d60e4580` 在 Reviewer 后中断。Reviewer 生成 `experiment/literature_search`，但冻结意图不允许该 stage/method 组合，gap 节点抛出 `ValueError: gap_task_outside_research_intent`。
+- **根因**：模型建议被当成可信控制指令；验证发生在会中断图的执行节点，而不是 Reviewer 输出边界。
+- **修复**：Reviewer prompt 携带冻结矩阵，返回后逐项验证。非法项变为 warning finding 和 `review.gap_rejected` 事件；无合法 gap 时进入 Writer。没有做模糊方法映射，也没有增加模型调用。
+- **验证边界**：注入测试覆盖合法/非法/全非法三种情况。它证明 Run 不因坏建议崩溃，不证明 Reviewer 总能找到正确的补证方向。
+
+### 完整工具历史导致 Token 重复增长
+
+- **现象**：同一基线 run 使用 175,153 token，其中输入 155,990；Researcher 每轮重复携带先前工具消息、正文和依赖证据。
+- **根因**：把 provider 会话历史同时当成长期状态与下一轮 prompt；没有在工具协议闭合处设置上下文生命周期边界。
+- **修复**：引入 `ResearchProgress` capsule，只传授权 source、候选 URL、合并 read ranges、检索命中、覆盖和未解决项。完整请求/响应仍进 action 账本；assistant/tool 配对闭合前不截断。跨 Agent 默认最多 16 组相关 Claim/Span，连续两轮无增益就停止。
+- **验证边界**：固定工具序列基准要求 serialized request bytes 至少下降 35%，且任务目标、授权来源和引用定位不变。这是通信体积基准，不等于真实任务 token 或质量必然下降/提升同样比例。
+
+### Soft pool 在 Scope 重试后过早拒绝
+
+- **现象**：受控 3DGS run `e52f1a4f-ea6e-4db4-888a-f0f7d3282f81` 的 Scope 因结构化截断重试，两个调用共 8,995 token；下一次 Plan 以完整输出 ceiling 预留时，被 18k Scope/Plan 池拒绝。Run 生成 needs_review 部分报告但没有进入 Research。
+- **根因**：设计了 9k contingency，却按孤立 group hard boundary 检查，重试波动无法借用 contingency。
+- **修复**：改为前向累计门槛 27k / 117k / 141k / 180k；前期只使用 contingency，不侵占 Writer/Patch 的 39k。
+- **验证边界**：68 项回归通过；授权只允许一次真实复测，因此修复后完整 3DGS 是否低于 180k 尚未实测。
+
+### Retrieval 配额让图绕过 Reviewer / Writer
+
+- **现象**：run `f4e6862f-abb8-475f-b0e4-720edf52b44c` 在 111,951 token、21 次模型和 30 次工具后以 `budget:retrieval_calls` 收口，界面得到低价值 `revision 999`。账本没有 Reviewer / Writer action，4 个任务只完成前 2 个。
+- **根因**：Researcher 按任务计算剩余 retrieval，数据库按 Run 执行上限；initial retrieval 位于任务异常边界外；failed task 又被当作依赖完成。逃逸异常进入 Worker 通用 partial，按存储顺序拼接 Claim。
+- **修复**：统一为 Run 级余量，配额竞争只移除 retrieval 工具；initial retrieval 纳入异常边界；failed 依赖取消下游。Research budget 耗尽后沿图进入 Review → Writer，Reviewer 可生成 provisional review，Writer 可生成确定性阶段报告。
+- **验证边界**：定向 20 项和完整 72 项测试通过。修复后尚无新付费 Run，不能声称真实报告已经达到质量目标。
+
+### “Embedding unavailable”不一定是 503
+
+- **现象**：上述 run 的 3 次 retrieval 都降级为 lexical，但 Embedding 日志无 503；新来源的向量索引在 Run 结束后 1–2 分钟才 ready。
+- **根因**：运行事件把“当前 source 的语义索引未 ready”和“Embedding 服务不可用”压成相近表述；索引异步完成速度慢于 Researcher。
+- **修复/优化**：保留 lexical fallback；Indexer 对真实 503 有界退避并用新 index version 恢复；诊断时同时检查 Embedding health、index job state 和时间线，不能只看前端降级标签。
+- **剩余问题**：v0.2.0 没有让所有新来源在首次 retrieval 前强制等待向量索引；这样会增加端到端等待并可能阻塞 lexical 可用路径。
+
+### 离线 Embedding 镜像启动 503
+
+- **现象**：旧镜像构建只缓存 gte 主模型。运行时 `trust_remote_code` 继续从 `Alibaba-NLP/new-impl` 取动态模块，但容器离线且只读，导致 health / index 请求 503。
+- **根因**：锁定模型 revision 不等于锁定 `auto_map` 引用的外部代码；临时模块目录也不适合作为只读运行依赖。
+- **修复**：固定 new-impl immutable commit，构建期复制到持久模型目录并做真实 768 维 warm-load；health 执行实际推理并验证 finite、non-zero、L2-normalized。Compose 等待 `service_healthy` 后才启动 API / Worker / Indexer。
+- **验证边界**：容器内 `/health` 和 `/embed` 返回 200、768 维、norm=1.0，修复后的日志无 503。它不证明任意模型升级都兼容，升级 revision 时必须重建并重测。
+
+### Parser 系统库与镜像差异
+
+- **现象**：增强 Parser 的 Python 依赖存在，但 OpenCV/native import 仍可能因 libGL、glib 或 libxcb 缺失失败；只看镜像 build 成功不足以发现。
+- **修复**：Parser Dockerfile 明确安装并保留 `libgl1`、`libglib2.0-0t64`、`libxcb1` 等系统库，构建后运行真实 import / parser 路径。
+- **验证边界**：当前固定基础镜像和依赖组合已验证；Debian/Python 基础镜像升级仍需重新核对包名和 ABI。
+
+### 常驻 Worker 干扰集成测试
+
+- **现象**：完整集成测试偶发出现队列上限、claim ownership 或 SIGKILL 恢复时序异常，单测单独运行却通过。
+- **根因**：测试与 Compose 常驻 Worker 连接同一 PostgreSQL；Worker 会领取测试创建的 queued Run，破坏测试对“由当前进程领取”的假设。
+- **修复**：完整基础设施测试前执行 `docker compose stop worker`，测试完成后恢复；测试租户仍随机化并只清理自己的数据库行。
+- **验证边界**：隔离 Worker 后完整套件稳定为 72 passed（26.38 秒）。这属于测试环境隔离，不是业务队列算法的性能改进。
+
+### 如何概括这轮系统性修复
+
+这次不是“把预算调大”或“给模型换提示词”，而是统一四组控制边界：模型建议与冻结意图、会话协议与长期状态、阶段 soft target 与 Run hard cap、任务失败与图级交付。可证明的是坏输入、暂时性基础设施故障和额度耗尽不再轻易绕过审查/写作；尚不能证明的是真实报告质量、同预算多 Agent 优势和 180k 目标在不同研究题材上都成立。
+
+## 10. 如何演示而不夸大？
 
 从 README 的 fixture 路径重建环境与两租户工作台，再查看真实 smoke 的原文、用量和未解决项。技术选型、论文理解、进程中断恢复分别使用对应脚本／测试；合成运行标明 synthetic，真实论文仍需核验实验条件。
 

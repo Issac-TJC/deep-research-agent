@@ -8,9 +8,13 @@ RUN uv sync --frozen --no-dev \
     && uv pip install --python .venv/bin/python \
        sentence-transformers==5.1.2 torch==2.8.0 huggingface-hub==0.35.3 \
     && .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Alibaba-NLP/gte-multilingual-base', revision='9bbca17', local_dir='/models/gte-multilingual-base')" \
+    && .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Alibaba-NLP/new-impl', revision='40ced75c3017eb27626c9d4ea981bde21a2662f4', local_dir='/models/new-impl')" \
+    && cp /models/new-impl/configuration.py /models/new-impl/modeling.py /models/gte-multilingual-base/ \
+    && .venv/bin/python -c "import json; p='/models/gte-multilingual-base/config.json'; c=json.load(open(p)); c['auto_map']={k:v.split('--')[-1] for k,v in c['auto_map'].items()}; open(p,'w').write(json.dumps(c,ensure_ascii=False))" \
+    && HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_MODULES_CACHE=/models/hf_modules SENTENCE_TRANSFORMERS_HOME=/models/st_cache .venv/bin/python -c "from sentence_transformers import SentenceTransformer; import numpy as np; m=SentenceTransformer('/models/gte-multilingual-base',trust_remote_code=True,device='cpu'); v=m.encode(['warm load'],normalize_embeddings=True); assert v.shape==(1,768) and np.linalg.norm(v[0])>0.99" \
     && find /models/gte-multilingual-base -type f -exec sha256sum {} \; | sort -k2 > /models/gte-multilingual-base.sha256
 ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
-    HF_MODULES_CACHE=/tmp/hf_modules SENTENCE_TRANSFORMERS_HOME=/tmp/st_cache
+    HF_MODULES_CACHE=/models/hf_modules SENTENCE_TRANSFORMERS_HOME=/models/st_cache
 RUN useradd -u 10001 -m research && chown -R research:research /models
 USER research
 CMD ["uvicorn", "research_agent.embedding_service:app", "--host", "0.0.0.0", "--port", "8002"]

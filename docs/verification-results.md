@@ -74,3 +74,38 @@
 - 任意复杂 PDF、OCR、论文代码执行、自动跨 run 语义记忆、SSO、源 ACL 撤销、未知费用自动对账。
 
 因此，简历可描述实际实现和测试范围，可引用带 run/profile/样本条件的调用与耗时；不能写“多 Agent 准确率提升 X%”“无损压缩”“已复现论文”或“生产级合规平台”。
+
+## 2026-09-13 稳定性与 token 优化验证
+
+已执行：
+
+| 验证 | 命令 | 结果 |
+|---|---|---|
+| Python 静态检查 | `.venv/bin/ruff check src tests migrations` | 通过 |
+| Python 单元测试 | `.venv/bin/pytest -q -m 'not integration'` | 39 passed |
+| 完整后端与基础设施 | `RUN_INTEGRATION=1 .venv/bin/pytest -q` | 68 passed，17.43 秒；包含 checkpoint capsule 恢复、并发预留、非法/合法 gap、部分报告与索引恢复 |
+| Python 编译 | `PYTHONPYCACHEPREFIX=/tmp/research-agent-pycache .venv/bin/python -m compileall -q src tests migrations` | 通过 |
+| Compose 配置 | `docker compose config -q` | 通过 |
+| Compose 镜像 | `docker compose build embedding parser api worker indexer migrate web` | 通过；Embedding 构建期真实 warm-load 768 维，Parser 的 OpenCV/libxcb 层构建通过 |
+| Embedding 运行时 | API 容器访问 `/health` 与 `/embed` | HTTP 200，`status=ready`，768 维，L2 norm=1.0；最近 Indexer/Embedding 日志无 503 |
+| Chrome 端到端 | `pnpm --dir apps/web exec playwright test` | 2 passed，8.1 秒；当前自动意图 UI、用量接口、PDF 解析与移动端预览 |
+| 固定工具序列通信基准 | `tests/test_token_strategy.py` | 序列化请求至少下降 35%，任务、授权 source 和 Claim/Span 定位不变 |
+
+真实复测 `e52f1a4f-ea6e-4db4-888a-f0f7d3282f81`：同类 3DGS brief，单 Run cap $0.50。结果 completed / needs_review、8,995 token、$0.005786724、无 `run.interrupted`、无 Embedding 503，并生成部分报告。它在 Scope 截断重试后暴露 soft pool 未使用 contingency 的缺陷，尚未进入 Research，因此不满足“最终完整报告”的验收条件。缺陷随后修成累计 27k / 117k / 141k / 180k，并通过 68 项回归；原授权限定一次真实 Run，所以没有把第二次付费运行伪装成已验证。
+
+尚未验证：修正后完整 3DGS Run 是否稳定低于 180k、最终研究质量是否优于 175,153-token 基线，以及 capsule 压缩对人工事实支持率的影响。工程门禁通过不等于研究结论已经人工认证。
+
+## v0.2.0（2026-09-14）预算收口状态机修复
+
+事故复现证据：Run `f4e6862f-abb8-475f-b0e4-720edf52b44c` 以 `budget:retrieval_calls`、111,951 token、`revision 999` 结束。20 个 claim 全部来自前两个任务；方法任务因研究 soft target 失败，实验任务保持 running；没有 Reviewer、Writer 或 Patcher action。新来源索引在 Run 结束后约 1–2 分钟陆续 ready，因此运行中的 `embedding_unavailable` 表示语义索引未 ready 后的 lexical fallback，不等价于 Embedding 服务 503。
+
+修复验证：
+
+| 验证 | 结果 |
+|---|---|
+| 事故链定向测试 | 20 passed；覆盖预算耗尽进入 Writer、依赖任务取消、Run 级 retrieval 余量、Reviewer provisional 审查、确定性降级报告 |
+| 完整后端／基础设施 | `RUN_INTEGRATION=1 .venv/bin/pytest -q`：72 passed，26.38 秒；发布前版本复跑 72 passed，20.02 秒 |
+| 静态与格式 | `.venv/bin/ruff check src tests migrations scripts`、目标文件 `ruff format --check`、`git diff --check` 均通过 |
+| 生产构建 | `docker compose build web api worker indexer migrate` 通过；Web 使用锁定的 Node 22 / pnpm 10.28.2 完成 Next.js 与 TypeScript 构建，Python 镜像安装 `deep-research-agent==0.2.0` |
+
+测试时需停止常驻 Compose Worker，否则它会领取测试租户的 queued Run，破坏队列上限与 SIGKILL 恢复测试的确定时序；测试完成后恢复 Worker。没有为此次修复运行新的真实 DeepSeek／Tavily 任务，因此尚未把工程回归结果表述为真实报告质量验收。

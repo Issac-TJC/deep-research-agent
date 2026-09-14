@@ -2,6 +2,49 @@
 
 本日志记录实际开发事实。`observed` 表示开发或联调实际遇到；`injected` 表示人为故障测试；`risk` 表示尚未验证的风险。测试使用的合成内容不等于真实研究结果。
 
+## v0.2.0 — 2026-09-14
+
+### 版本边界
+
+- 对比基线：上次 pull 后的 `9bba9093278aae02f83db47b28da4c55af753407`，即 2026-09-13 21:57:46 EDT 的 `merge origin/main: Fast-forward`。本节只汇总该基线之后的本地修改；更早事故保留在后续历史条目中。
+- 兼容性：`CreateRun` / `RunProfile` 请求格式和 `GET /research-runs/{id}/usage` 数组格式不变；旧 Run 可查询、查看与导出。运行代码指纹已变化，修复前 checkpoint 不迁移，必须新建 Run。
+
+### 多 Agent 审查与通信
+
+- Reviewer 现在显式接收冻结的 `stage → allowed methods` 矩阵。返回后逐条验证 `gap_tasks`：合法项保留；非法项变成 warning finding 并发送 `review.gap_rejected`，记录原 stage、method、允许值和原因。系统不再抛出 `gap_task_outside_research_intent`，也不静默改写研究方法或额外调用模型修复。
+- 全部补证项无效时直接进入 Writer，最终以 `needs_review` 披露缺口，避免审计建议反过来中断 Run。
+- 新增 `ResearchProgress` capsule。工具协议闭合后，下一轮只重建固定 policy / brief、任务、capsule 和当前相关证据，不再重放完整历史。capsule 保存授权来源、候选 URL、合并后的已读范围、检索命中、验收覆盖、未解决项和最近工具结果，不保存完整 messages。
+- 跨 Agent 证据改为 Claim / EvidenceSpan bundle，按问题相关性和稳定 ID 排序，默认最多 16 组；省略项进入 context snapshot，完整 action request/response 仍受 RLS 保护并可用于审计。连续两轮没有新来源、Claim、Span、冲突或覆盖时提前停止。
+
+### Token 计量与预算
+
+- 新增内部 180k soft target，保留外部 `RunProfile.max_tokens=250000` absolute hard cap。预算池为 Scope/Plan 18k、Research/Extraction 90k、Review/Gap 24k、Writer/Patch 39k、Contingency 9k；未用额度只向后流转，阶段累计门槛为 27k / 117k / 141k / 180k。
+- 分离 `serialized_bytes`、`estimated_input_tokens` 和 provider actual tokens；前两者分别用于尺寸诊断与 soft 调度，只有供应商实际用量用于最终账本和硬上限结算。
+- 角色输出 ceiling 调整为工具决策/抽取 4k、Scope/Plan/Reviewer 8k、Writer/Patcher 16k。70% 强制 capsule 和证据去重；85% 停止发现新来源；95% 停止补证并保护写作。
+- migration `0005_token_accounting.py` 为 actions 增加 `role`、`budget_group`、`serialized_bytes`、`estimated_input_tokens`、`output_token_ceiling` 和受保护 request；旧 action 缺失字段时归为 `legacy`，保持可读。
+
+### 预算收口状态机
+
+- Retrieval 余量改为按整个 Run 计算；并发竞争或配额耗尽时只关闭 retrieval 工具，保留已授权来源的 lexical/read/extract 路径。initial retrieval 纳入任务异常边界。
+- Research soft budget 耗尽后记录 `research.budget_exhausted`，停止派发并取消依赖失败任务；failed 不再被当作依赖完成。图仍进入 Review → Writer，且预算收口阶段禁止新增 gap / patch。
+- Reviewer 无可用额度时生成 provisional review 和 `review.degraded`；Writer 无可用额度时按交付任务生成确定性阶段报告和 `writer.degraded`。Worker 最外层部分交付复用同一结构，不再输出按存储顺序拼接的 `Partial research / revision 999` 任意 Claim 列表。
+- 发布保留原始 budget stop reason；任一 failed / cancelled task 都使质量保持 `needs_review`。这修复了“预留 Writer 预算但异常直接绕过 Writer”的控制流缺陷。
+
+### Embedding、Indexer 与 Parser
+
+- 保持 `Alibaba-NLP/gte-multilingual-base@9bbca17` 和 768 维索引；构建阶段固定 `Alibaba-NLP/new-impl@40ced75c3017eb27626c9d4ea981bde21a2662f4`，把动态代码复制到持久模型目录并执行联网 warm-load。
+- Embedding 运行时为只读、离线网络；`/health` 必须实际推理出有限、非零、L2 归一化的 768 维向量才 ready。API、Worker、Indexer 通过 Compose `service_healthy` 等待它。
+- Indexer 对暂时性 503 使用 1/2/4 秒有界退避；失败时保留 `lexical_ready`，服务恢复后以新 index version 补建，不覆盖旧可用版本。
+- Parser 镜像保留并验证 OpenCV 所需的 `libgl1`、`libglib2.0-0t64`、`libxcb1` 等系统依赖，避免增强解析镜像构建成功但运行导入失败。
+
+### API、工作台与验证
+
+- 新增 `GET /research-runs/{id}/usage-summary`，返回 totals、180k soft target、250k hard cap、budget group 的输入/输出/缓存/调用/费用和 degradation events；旧 `/usage` 不变。
+- 工作台“调用与用量”新增阶段进度条、soft/hard 剩余量、缓存命中和降级原因，不暴露运行时策略编辑控件。Playwright mock 与断言同步更新。
+- 新增通信基准和 token 策略测试，并扩充 gap 容错、预算并发预留、checkpoint capsule 恢复、范围去重、索引 503 恢复、预算耗尽仍出报告等回归。
+- 隔离常驻 Compose Worker 后，`RUN_INTEGRATION=1 .venv/bin/pytest -q` 提交前复跑为 72 passed（20.02 秒；此前同套件 26.38 秒）；Ruff、`git diff --check`、Compose 配置和生产镜像构建均通过。Web 在 Docker 锁定的 Node 22 / pnpm 10.28.2 环境中完成 Next.js / TypeScript 生产构建；宿主 shell 没有 `node`，因此不把宿主构建失败误记为源码失败。常驻 Worker 必须在集成测试前停止，否则会抢占测试队列。
+- 受控真实 Run `e52f1a4f-ea6e-4db4-888a-f0f7d3282f81` 使用 8,995 token、$0.005786724，无 Embedding 503，但暴露 Scope 重试未使用 contingency，随后已修复。用户 Run `f4e6862f-abb8-475f-b0e4-720edf52b44c` 暴露 retrieval 收口绕过 Writer，随后完成状态机修复。修复后未再发起付费复测，因此 v0.2.0 的真实报告质量和完整 3DGS ≤180k 目标仍标为未验证。
+
 ## 2026-09-11：开始 V1 实现
 
 - 分支：`research-blueprint-v1`；初始仓库只有 README、蓝图和 Git 配置，保留此前两份文档的未提交修改。
@@ -129,3 +172,25 @@ README 已补全用途、角色、memory／上下文／harness／workflow、环�
 
 
 最终浏览器复测：真实 Chrome 2 项通过（11.3 秒），截图检查桌面引用高亮和移动端 PDF；测试后 API／Worker 恢复 live 模式，工作台保留本地运行历史。完整质量评测和保留集实验尚未执行，已在 README／verification-results 中标注。
+
+### 多 Agent 稳定性与 token 优化（2026-09-13）
+
+基线 run `6816d735-e28c-408e-b70b-7a16d60e4580` 使用 175,153 token（输入 155,990、输出 19,163、缓存命中 64,640）。两个直接根因是：Reviewer 产生 `experiment/literature_search`，越过冻结意图后在 gap 节点抛出 `ValueError: gap_task_outside_research_intent`；Researcher 在每轮工具调用后继续重放完整消息、读取正文和依赖证据，输入 token 随轮次重复增长。并行索引另有独立 503：`gte-multilingual-base` 的 `auto_map` 指向 `Alibaba-NLP/new-impl`，旧镜像只缓存主模型，离线运行时无法取得动态代码。
+
+修复包括：Reviewer 显式接收 stage→allowed methods 矩阵，非法 gap 变成 warning 与 `review.gap_rejected`；引入 `ResearchProgress` capsule、16 组证据 bundle、读取范围合并和两轮无增益停止；加入 180k 分组 soft target、70/85/95% 降级、动作级估算与 usage-summary。Embedding 镜像固定 `new-impl@40ced75c3017eb27626c9d4ea981bde21a2662f4`，复制动态模块到模型目录并离线 warm-load；健康检查运行真实 768 维归一化推理，Indexer 对 503 做 1/2/4 秒有界退避并保留 `lexical_ready`。Parser 的 OpenCV/libxcb 系统依赖修复继续保留。
+
+本次只支持新 Run；旧记录可读，不迁移旧 checkpoint。工程验证与真实复测结果记录在 `verification-results.md`，未执行项不会写成通过。
+
+首次受控 3DGS 复测为 `e52f1a4f-ea6e-4db4-888a-f0f7d3282f81`。Scope 的结构化响应发生截断重试，两个已结算调用共 8,995 token；旧 soft-pool 实现又按下一次 Plan 的完整输出 ceiling 预留，18k Scope/Plan 池提前拒绝。Run 正确降级为 completed / needs_review 部分报告，未出现 `run.interrupted`，费用 $0.005786724，Embedding 无 503，但没有进入研究阶段，不能视为验收通过。
+
+随后修正为让 9k contingency 吸收阶段重试超额，累计阶段门槛 27k / 117k / 141k / 180k，仍为 Writer/Patch 保留 39k。修正后 68 项完整后端测试通过；由于原授权限定一次真实复测，没有擅自创建第二个付费 Run。
+
+### 预算收口绕过 Writer 的系统性缺陷（2026-09-14）
+
+用户 Run `f4e6862f-abb8-475f-b0e4-720edf52b44c` 在 111,951 token、21 次模型调用和 30 次工具调用后以 `budget:retrieval_calls` 结束，报告为 `revision 999`。账本显示只有 Researcher／Source Analyst 产出，Reviewer／Writer 均未调用；4 个计划任务只完成前 2 个，方法任务先触发 `soft_target:research_extraction`，其依赖的实验任务随后仍被启动。3 次 retrieval 均在新来源语义索引尚未 ready 时降级为 lexical；索引最终在 Run 结束后才 ready，Embedding 服务本身没有 503。
+
+根因是三个控制边界不一致：Researcher 按本任务计算剩余 retrieval，而数据库执行全 Run 上限；每个依赖任务启动时的 initial retrieval 位于任务异常边界之外；调度器把 failed task 也视为依赖完成。逃逸的 `BudgetExceeded` 被 Worker 直接转换为固定 `Partial research` 模板，只按存储顺序复制 claim，绕过 Review／Writer，导致预留写作额度不可达。
+
+修复后，Researcher 使用 Run 级 retrieval 余量；配额耗尽或并发竞争只关闭 retrieval 并继续读取已授权来源。研究阶段模型预算耗尽会记录 `research.budget_exhausted`，取消未启动及依赖失败任务，并沿图进入 Review → Writer；预算收口禁止新增 gap 和 patch。Reviewer 额度不足时把精确 span claim 标为 provisional 并记录 `review.degraded`；Writer 额度不足时生成按交付任务组织的确定性阶段报告，不再输出任意 claim 列表。发布保留原始 budget stop reason，failed/cancelled task 均使质量保持 `needs_review`。Worker 最外层兜底也复用相同结构化阶段报告。
+
+新增回归覆盖研究预算收口、依赖任务取消、retrieval 配额降级、Reviewer provisional 审查和 Writer 确定性报告。隔离常驻 Worker 后，完整后端与基础设施套件为 72 passed（26.38 秒）；静态检查与 diff 检查通过。此次没有发起新的付费 Run。

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import threading
 
@@ -42,11 +43,30 @@ def model():
     return _model
 
 
+def valid_vector(row) -> bool:
+    values = row.tolist() if hasattr(row, "tolist") else list(row)
+    if len(values) != 768 or not all(math.isfinite(float(value)) for value in values):
+        return False
+    norm = math.sqrt(sum(float(value) ** 2 for value in values))
+    return norm > 0 and abs(norm - 1.0) < 0.02
+
+
 @app.get("/health")
 async def health():
+    try:
+        probe = await asyncio.to_thread(
+            model().encode,
+            ["health check"],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+        )
+        if len(probe) != 1 or not valid_vector(probe[0]):
+            raise RuntimeError("invalid embedding probe")
+    except Exception as exc:
+        raise HTTPException(503, "embedding model is not ready") from exc
     return {
-        "status": "ok",
-        "loaded": _model is not None,
+        "status": "ready",
+        "loaded": True,
         "model": "Alibaba-NLP/gte-multilingual-base",
         "revision": "9bbca17",
         "dimensions": 768,
@@ -68,6 +88,6 @@ async def embed(body: EmbedRequest):
     except Exception as exc:
         raise HTTPException(503, "embedding inference failed") from exc
     values = [normalize_vector(row.tolist()) for row in vectors]
-    if any(len(row) != 768 for row in values):
-        raise HTTPException(503, "embedding model returned unexpected dimensions")
+    if any(not valid_vector(row) for row in values):
+        raise HTTPException(503, "embedding model returned invalid vector")
     return {"vectors": values, "model_revision": "9bbca17"}

@@ -1,7 +1,9 @@
+import httpx
 import pytest
 from pydantic import ValidationError
 
 from research_agent.contracts import ParsedDocument, RetrievalHit, TextBlock
+from research_agent.indexer import embed_with_backoff
 from research_agent.retrieval import (
     MAX_CHARS,
     chunk_document,
@@ -111,3 +113,25 @@ def test_benchmark_relevance_uses_source_and_span_overlap():
     assert overlaps({"source_id": "s1", "start": 150, "end": 250}, passage)
     assert not overlaps({"source_id": "s2", "start": 150, "end": 250}, passage)
     assert not overlaps({"source_id": "s1", "start": 200, "end": 250}, passage)
+
+
+async def test_embedding_503_recovers_with_bounded_backoff(monkeypatch):
+    delays = []
+
+    async def no_wait(delay):
+        delays.append(delay)
+
+    class RecoveringClient:
+        calls = 0
+
+        async def embed(self, texts):
+            self.calls += 1
+            if self.calls < 3:
+                response = httpx.Response(503, request=httpx.Request("POST", "http://embedding/embed"))
+                raise httpx.HTTPStatusError("unavailable", request=response.request, response=response)
+            return [[1.0, 0.0]]
+
+    monkeypatch.setattr("research_agent.indexer.asyncio.sleep", no_wait)
+    client = RecoveringClient()
+    assert await embed_with_backoff(client, ["text"]) == [[1.0, 0.0]]
+    assert client.calls == 3 and delays == [1, 2]

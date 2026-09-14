@@ -478,11 +478,13 @@ class ContextSnapshot(Contract):
     strategy: str
     estimated_tokens_before: int
     estimated_tokens_after: int
+    serialized_bytes_before: int = 0
+    serialized_bytes_after: int = 0
     selected_ids: list[str]
     omitted_ids: list[str]
     constraints_hash: str
     truncated: bool
-    token_estimator: str = "utf8_bytes_upper_bound_v1"
+    token_estimator: str = "multilingual_conservative_v2"
 
 
 class RunEvent(Contract):

@@ -6,8 +6,8 @@ from uuid import uuid4
 import httpx
 import pytest
 
-from research_agent.contracts import CreateRun, ReportDraft, ResearchBrief, RunProfile
-from research_agent.db import StaleLease
+from research_agent.contracts import CreateRun, ReportDraft, ResearchBrief, ResearchTask, RunProfile
+from research_agent.db import BudgetExceeded, StaleLease
 from research_agent.fetch import UnsafeURL, fetch_public
 from research_agent.fixtures import FixtureProvider
 from research_agent.gateway import Gateway
@@ -56,6 +56,256 @@ async def setup_engine(env):
     run, _ = await env["service"].create(env["tenant"], request, str(uuid4()))
     lease = await env["db"].claim(str(run["id"]))
     return ResearchEngine(env["db"], env["store"], env["tenant"], run, lease["token"])
+
+
+class _Snapshot:
+    values = {}
+
+
+class _ResearcherGraph:
+    def __init__(self, failure=None):
+        self.failure = failure
+        self.initial = []
+
+    async def aget_state(self, config):
+        return _Snapshot()
+
+    async def ainvoke(self, initial, config):
+        self.initial.append(initial)
+        if self.failure:
+            raise self.failure
+
+
+def review_state(task, *, allowed_method="source_synthesis"):
+    intent = {
+        "normalized_question": "Compare retrieval under explicit constraints",
+        "mode": "research_design",
+        "stages": [
+            {
+                "stage": "experiment",
+                "role": "deliverable",
+                "objective": "Design a valid evaluation",
+                "methods": [allowed_method],
+                "deliverable": "Experiment plan",
+                "reason": "Required by the brief",
+            }
+        ],
+    }
+    return {
+        "intent": intent,
+        "plan": {"intent": intent, "tasks": [task], "questions": ["q"], "rationale": "r"},
+        "tasks": [task],
+        "gap_round": 0,
+        "revision": 0,
+    }
+
+
+@pytest.mark.integration
+async def test_research_budget_exhaustion_defers_dependents_and_reaches_writer(env):
+    engine = await setup_engine(env)
+    first = ResearchTask(
+        id="budgeted-task",
+        question_id="q1",
+        objective="Collect evidence",
+        query="evidence",
+        acceptance_criteria=["one claim"],
+    )
+    dependent = ResearchTask(
+        id="dependent-task",
+        question_id="q2",
+        objective="Design the evaluation",
+        query="evaluation",
+        acceptance_criteria=["protocol"],
+        depends_on=[first.id],
+        stage="experiment",
+    )
+    for task in (first, dependent):
+        await engine.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+    graph = _ResearcherGraph(BudgetExceeded("soft_target:research_extraction"))
+    engine.researcher_graph = lambda: graph
+
+    result = await engine.research(
+        {"tasks": [first.model_dump(mode="json"), dependent.model_dump(mode="json")], "gap_round": 0}
+    )
+
+    tasks = {task["id"]: task for task in result["tasks"]}
+    assert result["stop_reason"] == "budget:soft_target:research_extraction"
+    assert result["research_budget_exhausted"] is True
+    assert tasks[first.id]["execution_status"] == "failed"
+    assert tasks[dependent.id]["execution_status"] == "cancelled"
+    assert tasks[dependent.id]["stop_reason"].startswith("deferred_after_budget:")
+    assert engine.route_review({**result, "review": {"gap_tasks": [{}]}}) == "write"
+    assert engine.route_write({**result, "report": {"title": "bounded"}}) == "publish"
+    events = await engine.db.events(engine.tenant, engine.run_id, 0)
+    assert any(event["event_type"] == "research.budget_exhausted" for event in events)
+
+
+@pytest.mark.integration
+async def test_exhausted_retrieval_quota_falls_back_without_ending_research(env):
+    engine = await setup_engine(env)
+    engine.profile = engine.profile.model_copy(update={"max_retrieval_calls": 0})
+    task = ResearchTask(
+        id="retrieval-task",
+        question_id="q1",
+        objective="Use already-authorized evidence",
+        query="evidence",
+        acceptance_criteria=["read source"],
+        source_ids=["authorized-source"],
+    )
+    await engine.put("task", task.id, task.model_dump(mode="json"), immutable=False)
+    graph = _ResearcherGraph()
+    engine.researcher_graph = lambda: graph
+
+    result = await engine.research({"tasks": [task.model_dump(mode="json")], "gap_round": 0})
+
+    assert "stop_reason" not in result
+    assert result["tasks"][0]["execution_status"] == "completed"
+    assert graph.initial[0]["retrieval_hits"] == []
+    warnings = await engine.db.records(engine.tenant, engine.run_id, "warning")
+    assert warnings[-1]["reason"] == "retrieval_budget_exhausted"
+
+
+@pytest.mark.integration
+async def test_writer_budget_failure_produces_structured_degraded_report(env):
+    engine = await setup_engine(env)
+    task = ResearchTask(
+        id="unfinished-deliverable",
+        question_id="q1",
+        objective="Design a reproducible experiment",
+        query="experiment",
+        acceptance_criteria=["datasets", "baselines", "metrics"],
+        stage="experiment",
+        execution_status="cancelled",
+        stop_reason="deferred_after_budget:soft_target:research_extraction",
+    ).model_dump(mode="json")
+    await engine.put("task", task["id"], task, immutable=False)
+
+    async def out_of_budget(*args, **kwargs):
+        raise BudgetExceeded("soft_target:writer_patch")
+
+    engine.gateway.structured = out_of_budget
+    result = await engine.write(
+        {
+            "tasks": [task],
+            "plan": {"tasks": [task]},
+            "review": {"accepted_claim_ids": [], "findings": [], "sufficient": False},
+            "stop_reason": "budget:soft_target:research_extraction",
+            "research_budget_exhausted": True,
+        }
+    )
+
+    report = result["report"]
+    assert report["title"] == "阶段性研究报告"
+    assert report["nodes"][0]["id"] == "research-status"
+    assert any(node["stage"] == "experiment" for node in report["nodes"])
+    assert all(node["id"] != "partial" for node in report["nodes"])
+    events = await engine.db.events(engine.tenant, engine.run_id, 0)
+    assert any(event["event_type"] == "writer.degraded" for event in events)
+
+
+@pytest.mark.integration
+async def test_reviewer_budget_failure_routes_provisional_evidence_to_writer(env):
+    engine = await setup_engine(env)
+    task = ResearchTask(
+        id="review-budget-task",
+        question_id="q1",
+        objective="Review available evidence",
+        query="evidence",
+        acceptance_criteria=["coverage"],
+        execution_status="completed",
+    ).model_dump(mode="json")
+    await engine.put("task", task["id"], task, immutable=False)
+
+    async def out_of_budget(*args, **kwargs):
+        raise BudgetExceeded("soft_target:review_gap")
+
+    engine.gateway.structured = out_of_budget
+    result = await engine.review(
+        {
+            "tasks": [task],
+            "plan": {"tasks": [task], "questions": ["q1"]},
+            "gap_round": 0,
+            "revision": 0,
+        }
+    )
+
+    assert result["review"]["sufficient"] is False
+    assert result["stop_reason"] == "budget:soft_target:review_gap"
+    assert result["research_budget_exhausted"] is True
+    assert engine.route_review(result) == "write"
+    events = await engine.db.events(engine.tenant, engine.run_id, 0)
+    assert any(event["event_type"] == "review.degraded" for event in events)
+
+
+@pytest.mark.integration
+async def test_invalid_gap_task_is_rejected_and_routes_to_writer(env):
+    engine = await setup_engine(env)
+    task = ResearchTask.model_validate(
+        {
+            "id": "existing-task",
+            "question_id": "q0",
+            "objective": "Design a valid evaluation",
+            "query": "evaluation",
+            "acceptance_criteria": ["protocol"],
+            "stage": "experiment",
+            "method": "source_synthesis",
+        }
+    ).model_dump(mode="json")
+    await engine.put("task", task["id"], task, immutable=False)
+
+    async def invalid_review(*args, **kwargs):
+        return {
+            "sufficient": False,
+            "accepted_claim_ids": [],
+            "covered_question_ids": [],
+            "gap_tasks": [
+                {
+                    **task,
+                    "id": "invalid-gap",
+                    "method": "literature_search",
+                }
+            ],
+        }
+
+    engine.gateway.structured = invalid_review
+    state = review_state(task)
+    result = await engine.review(state)
+    assert result["review"]["gap_tasks"] == []
+    assert any("gap_task_outside_research_intent" in f["reason"] for f in result["review"]["findings"])
+    assert engine.route_review({**state, **result}) == "write"
+    events = await engine.db.events(engine.tenant, engine.run_id, 0)
+    assert any(event["event_type"] == "review.gap_rejected" for event in events)
+
+
+@pytest.mark.integration
+async def test_legal_gap_task_is_preserved(env):
+    engine = await setup_engine(env)
+    task = ResearchTask.model_validate(
+        {
+            "id": "existing-task",
+            "question_id": "q0",
+            "objective": "Design a valid evaluation",
+            "query": "evaluation",
+            "acceptance_criteria": ["protocol"],
+            "stage": "experiment",
+            "method": "source_synthesis",
+        }
+    ).model_dump(mode="json")
+    await engine.put("task", task["id"], task, immutable=False)
+
+    async def legal_review(*args, **kwargs):
+        return {
+            "sufficient": False,
+            "accepted_claim_ids": [],
+            "covered_question_ids": [],
+            "gap_tasks": [{**task, "id": "legal-gap"}],
+        }
+
+    engine.gateway.structured = legal_review
+    state = review_state(task)
+    result = await engine.review(state)
+    assert [item["id"] for item in result["review"]["gap_tasks"]] == ["legal-gap"]
+    assert engine.route_review({**state, **result}) == "gaps"
 
 
 @pytest.mark.integration
