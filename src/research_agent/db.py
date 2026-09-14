@@ -35,6 +35,10 @@ def digest(value: Any) -> str:
     ).hexdigest()
 
 
+def vector_literal(values: list[float]) -> str:
+    return "[" + ",".join(f"{float(value):.9g}" for value in values) + "]"
+
+
 class Database:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -135,6 +139,28 @@ class Database:
             ).fetchone()
             await self.event(conn, tenant, run_id, "run.queued", {"mode": self.settings.research_mode})
             return r, True
+
+    async def resolve_upload_ids(self, tenant: str, upload_ids: list[str]) -> list[str]:
+        resolved = []
+        async with self.tx(tenant) as conn:
+            for item in upload_ids:
+                source = await (
+                    await conn.execute("SELECT id FROM records WHERE id=%s AND kind='source'", (item,))
+                ).fetchone()
+                if source:
+                    resolved.append(item)
+                    continue
+                upload = await (
+                    await conn.execute(
+                        "SELECT status,source_id FROM source_uploads WHERE upload_id=%s", (item,)
+                    )
+                ).fetchone()
+                if not upload:
+                    raise NotFound("upload not accessible")
+                if upload["status"] != "ready" or not upload["source_id"]:
+                    raise Conflict("upload_not_ready")
+                resolved.append(upload["source_id"])
+        return resolved
 
     async def run(self, tenant: str, run_id: str) -> dict:
         async with self.tx(tenant) as conn:
@@ -279,6 +305,359 @@ class Database:
                 ).fetchall()
             ]
 
+    async def source_artifacts(self, tenant: str, source_id: str) -> list[dict]:
+        async with self.tx(tenant) as conn:
+            return [
+                row["data"]
+                for row in await (
+                    await conn.execute(
+                        """SELECT data FROM records
+                        WHERE kind='derived_artifact' AND data->>'source_id'=%s
+                        ORDER BY created_at,id""",
+                        (source_id,),
+                    )
+                ).fetchall()
+            ]
+
+    async def enqueue_upload(
+        self, tenant: str, upload_id: str, raw_hash: str, raw_key: str, mime: str, title: str, parser_mode: str
+    ):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                """INSERT INTO source_uploads
+                (tenant_id,upload_id,raw_hash,raw_key,mime,title,parser_mode)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(tenant_id,upload_id) DO NOTHING""",
+                (tenant, upload_id, raw_hash, raw_key, mime, title, parser_mode),
+            )
+
+    async def upload_status(self, tenant: str, upload_id: str) -> dict:
+        async with self.tx(tenant) as conn:
+            row = await (
+                await conn.execute("SELECT * FROM source_uploads WHERE upload_id=%s", (upload_id,))
+            ).fetchone()
+            if not row:
+                raise NotFound(upload_id)
+            return row
+
+    async def claim_upload(self) -> dict | None:
+        async with self.pool.connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT * FROM claim_next_source_upload(%s,%s)",
+                    (self.settings.worker_id + "-indexer", self.settings.index_lease_seconds),
+                )
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def complete_upload(self, tenant: str, upload_id: str, source_id: str):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                """UPDATE source_uploads SET status='ready',source_id=%s,progress=1,
+                error=NULL,lease_until=NULL,updated_at=now() WHERE upload_id=%s""",
+                (source_id, upload_id),
+            )
+
+    async def heartbeat_upload(self, tenant: str, upload_id: str):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                """UPDATE source_uploads
+                SET lease_until=now()+make_interval(secs=>%s),updated_at=now()
+                WHERE upload_id=%s AND status='processing'""",
+                (self.settings.index_lease_seconds, upload_id),
+            )
+
+    async def fail_upload(self, tenant: str, upload_id: str, error: str):
+        async with self.tx(tenant) as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT attempts FROM source_uploads WHERE upload_id=%s", (upload_id,)
+                )
+            ).fetchone()
+            retry = bool(row and row["attempts"] < 3)
+            await conn.execute(
+                """UPDATE source_uploads SET status=%s,error=%s,
+                lease_until=CASE WHEN %s THEN now()+interval '10 seconds' ELSE NULL END,
+                updated_at=now() WHERE upload_id=%s""",
+                ("processing" if retry else "failed", error[:300], retry, upload_id),
+            )
+
+    async def enqueue_index(
+        self,
+        tenant: str,
+        source_id: str,
+        parsed_hash: str,
+        index_version: str,
+        chunker_version: str,
+        embedding_model: str,
+        embedding_revision: str,
+    ):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                """INSERT INTO source_index_jobs
+                (tenant_id,source_id,parsed_hash,index_version,chunker_version,
+                 embedding_model,embedding_revision)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT(tenant_id,source_id,index_version) DO NOTHING""",
+                (
+                    tenant,
+                    source_id,
+                    parsed_hash,
+                    index_version,
+                    chunker_version,
+                    embedding_model,
+                    embedding_revision,
+                ),
+            )
+
+    async def requeue_index(
+        self,
+        tenant: str,
+        source_id: str,
+        parsed_hash: str,
+        index_version: str,
+        chunker_version: str,
+        embedding_model: str,
+        embedding_revision: str,
+    ):
+        """Create a new build while the last usable index remains searchable."""
+        await self.enqueue_index(
+            tenant,
+            source_id,
+            parsed_hash,
+            index_version,
+            chunker_version,
+            embedding_model,
+            embedding_revision,
+        )
+
+    async def index_status(self, tenant: str, source_id: str) -> dict | None:
+        async with self.tx(tenant) as conn:
+            return await (
+                await conn.execute(
+                    """SELECT * FROM source_index_jobs WHERE source_id=%s
+                    ORDER BY created_at DESC LIMIT 1""",
+                    (source_id,),
+                )
+            ).fetchone()
+
+    async def usable_index_status(self, tenant: str, source_id: str) -> dict | None:
+        async with self.tx(tenant) as conn:
+            return await (
+                await conn.execute(
+                    """SELECT * FROM source_index_jobs
+                    WHERE source_id=%s AND status IN ('lexical_ready','ready')
+                    ORDER BY created_at DESC LIMIT 1""",
+                    (source_id,),
+                )
+            ).fetchone()
+
+    async def index_job(self, tenant: str, source_id: str, index_version: str) -> dict | None:
+        async with self.tx(tenant) as conn:
+            return await (
+                await conn.execute(
+                    """SELECT * FROM source_index_jobs
+                    WHERE source_id=%s AND index_version=%s""",
+                    (source_id, index_version),
+                )
+            ).fetchone()
+
+    async def claim_index(self) -> dict | None:
+        async with self.pool.connection() as conn:
+            row = await (
+                await conn.execute(
+                    "SELECT * FROM claim_next_index_job(%s,%s)",
+                    (self.settings.worker_id + "-indexer", self.settings.index_lease_seconds),
+                )
+            ).fetchone()
+            return dict(row) if row else None
+
+    async def heartbeat_index(self, tenant: str, source_id: str, index_version: str):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                """UPDATE source_index_jobs
+                SET lease_until=now()+make_interval(secs=>%s),updated_at=now()
+                WHERE source_id=%s AND index_version=%s
+                  AND status IN ('processing','lexical_ready')""",
+                (self.settings.index_lease_seconds, source_id, index_version),
+            )
+
+    async def save_lexical_chunks(
+        self, tenant: str, source_id: str, parsed_hash: str, index_version: str, chunks: list[dict]
+    ):
+        async with self.tx(tenant) as conn:
+            await conn.execute(
+                "DELETE FROM document_chunks WHERE source_id=%s AND index_version=%s",
+                (source_id, index_version),
+            )
+            for chunk in chunks:
+                await conn.execute(
+                    """INSERT INTO document_chunks
+                    (tenant_id,source_id,parsed_hash,index_version,chunk_id,ordinal,start_char,end_char,
+                     page,bbox,kind,section_path,block_id,text,lexical_text,textsearch)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                            to_tsvector('simple',%s))""",
+                    (
+                        tenant,
+                        source_id,
+                        parsed_hash,
+                        index_version,
+                        chunk["chunk_id"],
+                        chunk["ordinal"],
+                        chunk["start"],
+                        chunk["end"],
+                        chunk["page"],
+                        Jsonb(chunk["bbox"]),
+                        chunk["kind"],
+                        Jsonb(chunk["section_path"]),
+                        chunk["block_id"],
+                        chunk["text"],
+                        chunk["lexical_text"],
+                        chunk["lexical_text"],
+                    ),
+                )
+            await conn.execute(
+                """UPDATE source_index_jobs SET status='lexical_ready',total_chunks=%s,
+                embedded_chunks=0,error=NULL,updated_at=now()
+                WHERE source_id=%s AND index_version=%s""",
+                (len(chunks), source_id, index_version),
+            )
+
+    async def save_embeddings(
+        self,
+        tenant: str,
+        source_id: str,
+        index_version: str,
+        rows: list[tuple[str, list[float]]],
+        model: str,
+        revision: str,
+    ):
+        async with self.tx(tenant) as conn:
+            for chunk_id, vector in rows:
+                await conn.execute(
+                    """UPDATE document_chunks SET embedding=%s::vector,embedding_model=%s,
+                    embedding_revision=%s WHERE source_id=%s AND index_version=%s AND chunk_id=%s""",
+                    (vector_literal(vector), model, revision, source_id, index_version, chunk_id),
+                )
+            total = await (
+                await conn.execute(
+                    """SELECT count(*) AS total,count(embedding) AS embedded FROM document_chunks
+                    WHERE source_id=%s AND index_version=%s""",
+                    (source_id, index_version),
+                )
+            ).fetchone()
+            status = "ready" if total["total"] == total["embedded"] else "lexical_ready"
+            await conn.execute(
+                """UPDATE source_index_jobs SET status=%s,total_chunks=%s,embedded_chunks=%s,
+                error=NULL,lease_until=CASE WHEN %s='ready' THEN NULL ELSE lease_until END,
+                updated_at=now()
+                WHERE source_id=%s AND index_version=%s""",
+                (
+                    status,
+                    total["total"],
+                    total["embedded"],
+                    status,
+                    source_id,
+                    index_version,
+                ),
+            )
+
+    async def fail_index(
+        self,
+        tenant: str,
+        source_id: str,
+        index_version: str,
+        error: str,
+        retry: bool = True,
+    ):
+        async with self.tx(tenant) as conn:
+            row = await (
+                await conn.execute(
+                    """SELECT total_chunks,attempts FROM source_index_jobs
+                    WHERE source_id=%s AND index_version=%s""",
+                    (source_id, index_version),
+                )
+            ).fetchone()
+            has_lexical = bool(row and row["total_chunks"])
+            should_retry = bool(retry and row and row["attempts"] < 3)
+            status = "lexical_ready" if has_lexical else ("processing" if should_retry else "failed")
+            await conn.execute(
+                """UPDATE source_index_jobs SET status=%s,error=%s,
+                lease_until=CASE WHEN %s THEN now()+interval '10 seconds' ELSE NULL END,
+                updated_at=now()
+                WHERE source_id=%s AND index_version=%s""",
+                (status, error[:300], should_retry, source_id, index_version),
+            )
+
+    async def chunk_rows(self, tenant: str, source_id: str, index_version: str) -> list[dict]:
+        async with self.tx(tenant) as conn:
+            return await (
+                await conn.execute(
+                    """SELECT chunk_id,text FROM document_chunks
+                    WHERE source_id=%s AND index_version=%s ORDER BY ordinal""",
+                    (source_id, index_version),
+                )
+            ).fetchall()
+
+    async def retrieval_candidates(
+        self,
+        tenant: str,
+        source_ids: list[str],
+        query_terms: str,
+        query_vector: list[float] | None,
+        strategy: str,
+    ) -> tuple[list[dict], list[dict]]:
+        if not source_ids:
+            return [], []
+        async with self.tx(tenant) as conn:
+            versions = await (
+                await conn.execute(
+                    """SELECT DISTINCT ON(source_id) source_id,index_version,status
+                    FROM source_index_jobs WHERE source_id=ANY(%s) AND status IN ('lexical_ready','ready')
+                    ORDER BY source_id,created_at DESC""",
+                    (source_ids,),
+                )
+            ).fetchall()
+            version_ids = [row["index_version"] for row in versions]
+            if not version_ids:
+                return [], []
+            lexical = []
+            if strategy in {"lexical", "hybrid"} and query_terms:
+                lexical = await (
+                    await conn.execute(
+                        """SELECT c.*,coalesce(r.data->>'title','') AS title,
+                        ts_rank_cd(c.textsearch,to_tsquery('simple',%s)) AS score
+                        FROM document_chunks c
+                        LEFT JOIN records r ON r.tenant_id=c.tenant_id AND r.id=c.source_id AND r.kind='source'
+                        WHERE c.index_version=ANY(%s)
+                          AND c.textsearch @@ to_tsquery('simple',%s)
+                        ORDER BY score DESC,c.source_id,c.start_char LIMIT 30""",
+                        (query_terms, version_ids, query_terms),
+                    )
+                ).fetchall()
+            dense = []
+            ready_versions = [row["index_version"] for row in versions if row["status"] == "ready"]
+            if strategy in {"hybrid", "dense"} and query_vector and ready_versions:
+                literal = vector_literal(query_vector)
+                dense = await (
+                    await conn.execute(
+                        """SELECT c.*,coalesce(r.data->>'title','') AS title,
+                        1-(c.embedding <=> %s::vector) AS score
+                        FROM document_chunks c
+                        LEFT JOIN records r ON r.tenant_id=c.tenant_id AND r.id=c.source_id AND r.kind='source'
+                        WHERE c.index_version=ANY(%s) AND c.embedding IS NOT NULL
+                        ORDER BY c.embedding <=> %s::vector,c.source_id,c.start_char LIMIT 30""",
+                        (literal, ready_versions, literal),
+                    )
+                ).fetchall()
+            def clean(row):
+                result = dict(row)
+                result["start"], result["end"] = result.pop("start_char"), result.pop("end_char")
+                result.pop("embedding", None)
+                result.pop("textsearch", None)
+                return result
+            return [clean(row) for row in lexical], [clean(row) for row in dense]
+
     async def events(self, tenant: str, run_id: str, after: int) -> list[dict]:
         await self.run(tenant, run_id)
         async with self.tx(tenant) as conn:
@@ -336,6 +715,8 @@ class Database:
                 raise BudgetExceeded("tool_calls")
             if kind == "search" and r["search_calls"] >= p.max_search_calls:
                 raise BudgetExceeded("search_calls")
+            if kind == "retrieve" and r["retrieval_calls"] >= p.max_retrieval_calls:
+                raise BudgetExceeded("retrieval_calls")
             if task_id and kind != "model":
                 if kind == "search" and p.variant != "B0":
                     searches = await (
@@ -369,8 +750,16 @@ class Database:
             await conn.execute(
                 """UPDATE research_runs SET reserved_usd=reserved_usd+%s,
                 reserved_tokens=reserved_tokens+%s,model_calls=model_calls+%s,tool_calls=tool_calls+%s,
-                search_calls=search_calls+%s WHERE id=%s""",
-                (usd, tokens, int(kind == "model"), int(kind != "model"), int(kind == "search"), run_id),
+                search_calls=search_calls+%s,retrieval_calls=retrieval_calls+%s WHERE id=%s""",
+                (
+                    usd,
+                    tokens,
+                    int(kind == "model"),
+                    int(kind != "model"),
+                    int(kind == "search"),
+                    int(kind == "retrieve"),
+                    run_id,
+                ),
             )
             await conn.execute(
                 """INSERT INTO actions(tenant_id,run_id,id,task_id,kind,status,reserved_usd,reserved_tokens)

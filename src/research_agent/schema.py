@@ -71,7 +71,15 @@ GRANT SELECT,INSERT,UPDATE,DELETE ON ALL TABLES IN SCHEMA public TO research_app
 REVOKE ALL ON tenants,api_keys FROM research_app;
 """
 
-TENANT_TABLES = ("research_runs", "records", "run_events", "actions")
+TENANT_TABLES = (
+    "research_runs",
+    "records",
+    "run_events",
+    "actions",
+    "source_uploads",
+    "source_index_jobs",
+    "document_chunks",
+)
 CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
 
 

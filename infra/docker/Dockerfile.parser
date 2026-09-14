@@ -1,0 +1,22 @@
+FROM python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
+WORKDIR /app
+COPY pyproject.toml uv.lock ./
+RUN pip install --no-cache-dir uv==0.12.13 \
+    && uv sync --frozen --no-dev --no-install-project
+COPY src ./src
+ENV HF_HOME=/models/huggingface
+RUN uv sync --frozen --no-dev \
+    && uv pip install --python .venv/bin/python \
+       "docling[rapidocr]==2.126.0" "huggingface-hub==0.35.3" \
+    && .venv/bin/docling-tools models download \
+    && .venv/bin/python -c "from pathlib import Path; from huggingface_hub import snapshot_download; p=Path(snapshot_download('HuggingFaceTB/SmolVLM-256M-Instruct', revision='7e3e67e')); r=p.parents[1]/'refs'; r.mkdir(exist_ok=True); (r/'main').write_text(p.name)" \
+    && find /root/.cache/docling /models -type f -exec sha256sum {} \; | sort -k2 > /tmp/parser-models.sha256 \
+    && mv /tmp/parser-models.sha256 /models/parser-models.sha256
+ENV PATH="/app/.venv/bin:$PATH" PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+    DOCLING_ARTIFACTS_PATH=/home/research/.cache/docling/models OMP_NUM_THREADS=4
+RUN useradd -u 10001 -m research \
+    && mkdir -p /home/research/.cache \
+    && cp -a /root/.cache/docling /home/research/.cache/docling \
+    && chown -R research:research /home/research /models
+USER research
+CMD ["uvicorn", "research_agent.parser_service:app", "--host", "0.0.0.0", "--port", "8001"]

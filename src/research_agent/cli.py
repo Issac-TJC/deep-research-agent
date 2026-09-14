@@ -11,7 +11,7 @@ from alembic import command
 from alembic.config import Config
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from research_agent.contracts import CreateRun
+from research_agent.contracts import CreateRun, SourceVersion, uid
 from research_agent.db import Database
 from research_agent.schema import CHECKPOINT_TABLES, policy_sql
 from research_agent.service import ResearchService
@@ -74,6 +74,51 @@ def worker(once: bool = False):
 
 
 @app.command()
+def indexer(once: bool = False):
+    """Run the asynchronous parser and document index worker."""
+    from research_agent.indexer import work
+
+    asyncio.run(work(settings(), once))
+
+
+@app.command()
+def reindex(all_sources: bool = typer.Option(False, "--all")):
+    """Queue additive index builds without invalidating the last usable version."""
+    if not all_sources:
+        raise typer.BadParameter("Pass --all to confirm reindexing every source")
+    s = settings()
+
+    async def run():
+        async with await psycopg.AsyncConnection.connect(s.admin_database_url) as admin:
+            rows = await (
+                await admin.execute(
+                    "SELECT tenant_id,data FROM records WHERE kind='source' ORDER BY created_at"
+                )
+            ).fetchall()
+        db = Database(s)
+        await db.open()
+        try:
+            from research_agent.retrieval import CHUNKER_VERSION
+
+            for tenant_id, data in rows:
+                source = SourceVersion.model_validate(data)
+                await db.requeue_index(
+                    str(tenant_id),
+                    source.id,
+                    source.parsed_hash,
+                    uid(),
+                    CHUNKER_VERSION,
+                    s.embedding_model,
+                    s.embedding_revision,
+                )
+        finally:
+            await db.close()
+        typer.echo(f"Queued {len(rows)} source index builds")
+
+    asyncio.run(run())
+
+
+@app.command()
 def submit(brief_file: Path, api_key: str = typer.Option(envvar="RESEARCH_API_KEY")):
     async def run():
         db = Database(settings())
@@ -123,6 +168,39 @@ def evaluate(
             corpus_manifest,
         )
     )
+
+
+@app.command("retrieval-benchmark")
+def retrieval_benchmark(
+    dataset: Path,
+    api_key: str = typer.Option(envvar="RESEARCH_API_KEY"),
+    enforce: bool = False,
+):
+    """Evaluate lexical, dense and hybrid Recall@8 on a frozen annotated corpus."""
+    from pydantic import TypeAdapter
+
+    from research_agent.evidence import EvidenceService
+    from research_agent.retrieval_benchmark import RetrievalCase, run_benchmark
+
+    cases = TypeAdapter(list[RetrievalCase]).validate_json(dataset.read_text(encoding="utf-8"))
+
+    async def run():
+        s = settings()
+        db, store = Database(s), ObjectStore(s)
+        await db.open()
+        await store.setup()
+        try:
+            tenant = await db.auth(api_key)
+            if not tenant:
+                raise typer.BadParameter("Invalid API key")
+            result = await run_benchmark(EvidenceService(db, store, tenant), cases)
+            typer.echo(json.dumps(result, indent=2))
+            if enforce and not result["quality_gate"]["passed"]:
+                raise typer.Exit(1)
+        finally:
+            await db.close()
+
+    asyncio.run(run())
 
 
 @app.command()

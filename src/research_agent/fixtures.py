@@ -52,13 +52,16 @@ class FixtureSearch:
         }
 
 
-def task(tid, objective, query):
+def task(tid, objective, query, stage="related_work", method="literature_search"):
     return {
         "id": tid,
         "question_id": tid,
         "objective": objective,
         "query": query,
         "acceptance_criteria": ["Read original source and preserve limitations"],
+        "stage": stage,
+        "method": method,
+        "deliverable": "Synthetic evidence-grounded synthesis",
     }
 
 
@@ -99,10 +102,42 @@ class FixtureProvider:
                     }
                 ]
         else:
-            if role == "planner":
+            if role == "research_director":
+                template = payload["brief"]["template"]
+                stage = "methodology" if template == "technical_comparison" else "related_work"
+                mode = "decision_support" if template == "technical_comparison" else "literature_review"
+                value = {
+                    "normalized_question": payload["brief"]["question"],
+                    "mode": mode,
+                    "stages": [
+                        {
+                            "stage": stage,
+                            "objective": payload["brief"]["question"],
+                            "methods": ["literature_search", "source_synthesis"],
+                            "deliverable": "Synthetic evidence-grounded synthesis",
+                            "reason": "Fixture intent used to verify stage-aware orchestration",
+                            "role": "deliverable",
+                            "depends_on": [],
+                        }
+                    ],
+                    "source_assignments": [
+                        {
+                            "source_id": source["source_id"],
+                            "role": "user_material",
+                            "reason": "Supplied fixture source",
+                        }
+                        for source in payload.get("available_sources", [])
+                    ],
+                    "assumptions": [],
+                    "capability_gaps": [],
+                }
+            elif role == "planner":
+                selected_stage = payload.get("research_intent", {}).get("stages", [{}])[0].get(
+                    "stage", "related_work"
+                )
                 tasks = [
-                    task("lexical", "Check exact technical identifiers", "lexical"),
-                    task("semantic", "Understand method and experiment design", "semantic paper"),
+                    task("lexical", "Check exact technical identifiers", "lexical", selected_stage),
+                    task("semantic", "Understand method and experiment design", "semantic paper", selected_stage),
                 ]
                 if payload.get("variant") == "B0":
                     tasks = [
@@ -142,6 +177,9 @@ class FixtureProvider:
                 }
             elif role == "reviewer":
                 claims = payload.get("claims", [])
+                selected_stage = payload.get("research_intent", {}).get("stages", [{}])[0].get(
+                    "stage", "related_work"
+                )
                 gap = (
                     not payload.get("report")
                     and payload.get("gap_round", 0) == 0
@@ -153,7 +191,10 @@ class FixtureProvider:
                     "sufficient": bool(claims) and not gap,
                     "gap_tasks": [
                         task(
-                            "gap-hybrid", "Check counterevidence and comparability", "hybrid counter evidence"
+                            "gap-hybrid",
+                            "Check counterevidence and comparability",
+                            "hybrid counter evidence",
+                            selected_stage,
                         )
                     ]
                     if gap
@@ -162,6 +203,9 @@ class FixtureProvider:
                 }
             elif role == "writer":
                 claims = payload.get("claims", [])
+                selected_stage = payload.get("research_intent", {}).get("stages", [{}])[0].get(
+                    "stage", "related_work"
+                )
                 nodes = [
                     {
                         "id": "summary",
@@ -169,10 +213,18 @@ class FixtureProvider:
                         "title": "Synthetic fixture report",
                         "text": "此报告用于验证系统流程，内容为合成测试材料。",
                         "attribution": "guidance",
+                        "stage": selected_stage,
+                        "output_mode": "guidance",
                     }
                 ]
                 nodes += [
-                    {"id": "claim-" + str(i), "kind": "paragraph", "text": c["text"], "claim_ids": [c["id"]]}
+                    {
+                        "id": "claim-" + str(i),
+                        "kind": "paragraph",
+                        "text": c["text"],
+                        "claim_ids": [c["id"]],
+                        "stage": selected_stage,
+                    }
                     for i, c in enumerate(claims)
                 ]
                 if payload["brief"]["template"] == "technical_comparison":
@@ -185,6 +237,8 @@ class FixtureProvider:
                                 {"approach": "lexical / vector / hybrid", "measured_latency": "unknown"}
                             ],
                             "attribution": "guidance",
+                            "stage": selected_stage,
+                            "output_mode": "guidance",
                         }
                     )
                 value = {

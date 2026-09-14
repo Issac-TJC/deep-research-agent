@@ -84,6 +84,26 @@ async def test_tenant_write_policy_rejects_cross_tenant_row(env):
             )
 
 
+@pytest.mark.parametrize("table", ["source_uploads", "source_index_jobs"])
+async def test_retrieval_tables_reject_cross_tenant_writes(env, table):
+    async with env["db"].tx(env["tenant"]) as conn:
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            if table == "source_uploads":
+                await conn.execute(
+                    """INSERT INTO source_uploads
+                    (tenant_id,upload_id,raw_hash,raw_key,mime,title)
+                    VALUES (%s,'forbidden-upload','h','k','text/plain','x')""",
+                    (env["other"],),
+                )
+            else:
+                await conn.execute(
+                    """INSERT INTO source_index_jobs
+                    (tenant_id,source_id,parsed_hash,index_version,chunker_version)
+                    VALUES (%s,'forbidden-source','h','v','c')""",
+                    (env["other"],),
+                )
+
+
 async def test_queue_and_cumulative_limits(env):
     for _ in range(10):
         await new_run(env)

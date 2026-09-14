@@ -1,4 +1,4 @@
-.PHONY: setup infra migrate test integration api worker web check
+.PHONY: setup infra migrate test integration api worker indexer web check
 setup:
 	uv sync --extra dev --frozen
 	cd apps/web && pnpm install --frozen-lockfile
@@ -14,6 +14,8 @@ api:
 	.venv/bin/uvicorn research_agent.api:app --host 127.0.0.1 --port 18000
 worker:
 	.venv/bin/research worker
+indexer:
+	.venv/bin/research indexer
 web:
 	cd apps/web && pnpm dev
 check:

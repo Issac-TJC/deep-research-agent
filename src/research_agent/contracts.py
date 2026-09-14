@@ -29,6 +29,27 @@ class Template(StrEnum):
     GENERAL = "general_research"
 
 
+class ResearchStage(StrEnum):
+    """A paper-shaped unit of work, selected from the user's actual intent."""
+
+    INTRODUCTION = "introduction"
+    RELATED_WORK = "related_work"
+    METHODOLOGY = "methodology"
+    EXPERIMENT = "experiment"
+    RESULTS = "results"
+    DISCUSSION = "discussion"
+    CONCLUSION = "conclusion"
+
+
+class ResearchMethod(StrEnum):
+    LITERATURE_SEARCH = "literature_search"
+    SOURCE_SYNTHESIS = "source_synthesis"
+    GAP_ANALYSIS = "gap_analysis"
+    REPRODUCTION = "reproduction"
+    EXPERIMENT_EXECUTION = "experiment_execution"
+    EVIDENCE_AUDIT = "evidence_audit"
+
+
 class ResearchBrief(Contract):
     question: str = Field(min_length=8, max_length=6000)
     template: Template = Template.GENERAL
@@ -41,6 +62,71 @@ class ResearchBrief(Contract):
     language: Literal["zh", "en"] = "zh"
     as_of: str | None = None
     version: int = 1
+
+
+class SourceAssignment(Contract):
+    source_id: str
+    role: Literal["primary_reference", "supporting_reference", "domain_seed", "user_material"]
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class StageDecision(Contract):
+    stage: ResearchStage
+    role: Literal["deliverable", "supporting"]
+    objective: str = Field(min_length=1, max_length=1000)
+    methods: list[ResearchMethod] = Field(min_length=1, max_length=4)
+    deliverable: str = Field(min_length=1, max_length=500)
+    reason: str = Field(min_length=1, max_length=500)
+    depends_on: list[ResearchStage] = Field(default_factory=list, max_length=6)
+
+
+class ResearchIntent(Contract):
+    """The compiled interpretation of one messy, multimodal user request."""
+
+    normalized_question: str = Field(min_length=8, max_length=6000)
+    mode: Literal[
+        "literature_review",
+        "research_design",
+        "reproduction",
+        "experiment",
+        "decision_support",
+    ]
+    stages: list[StageDecision] = Field(min_length=1, max_length=7)
+    source_assignments: list[SourceAssignment] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list, max_length=12)
+    capability_gaps: list[str] = Field(default_factory=list, max_length=12)
+
+    @model_validator(mode="after")
+    def valid_stage_dag(self):
+        if len({item.stage for item in self.stages}) != len(self.stages):
+            raise ValueError("research intent stages must be unique")
+        if not any(item.role == "deliverable" for item in self.stages):
+            raise ValueError("research intent requires at least one deliverable stage")
+        known = {item.stage for item in self.stages}
+        dependencies = {item.stage: set(item.depends_on) for item in self.stages}
+        if any(stage in deps or not deps <= known for stage, deps in dependencies.items()):
+            raise ValueError("research intent has invalid stage dependency")
+        visited: set[ResearchStage] = set()
+        while len(visited) < len(known):
+            ready = {stage for stage, deps in dependencies.items() if stage not in visited and deps <= visited}
+            if not ready:
+                raise ValueError("research intent stage dependency cycle")
+            visited.update(ready)
+        needed: set[ResearchStage] = set()
+
+        def include(stage: ResearchStage):
+            if stage in needed:
+                return
+            needed.add(stage)
+            for dependency in dependencies[stage]:
+                include(dependency)
+
+        for item in self.stages:
+            if item.role == "deliverable":
+                include(item.stage)
+        if any(item.role == "supporting" and item.stage not in needed for item in self.stages):
+            raise ValueError("supporting research stage is not required by a deliverable")
+        return self
 
 
 class RunProfile(Contract):
@@ -65,6 +151,9 @@ class RunProfile(Contract):
     paper_related_sources: int = Field(default=3, ge=0, le=3)
     context_strategy: Literal["evidence", "full"] = "evidence"
     search_policy: Literal["live", "frozen"] = "live"
+    retrieval_strategy: Literal["sequential", "lexical", "hybrid"] = "hybrid"
+    max_retrieval_calls: int = Field(default=3, ge=0, le=6)
+    parser_mode: Literal["native", "auto", "enhanced"] = "auto"
 
 
 class CreateRun(Contract):
@@ -83,12 +172,17 @@ class ResearchTask(Contract):
     execution_status: Literal["pending", "running", "completed", "failed", "cancelled"] = "pending"
     stop_reason: str | None = None
     acceptance: Literal["unchecked", "accepted", "rejected"] = "unchecked"
+    stage: ResearchStage = ResearchStage.RELATED_WORK
+    method: ResearchMethod = ResearchMethod.LITERATURE_SEARCH
+    deliverable: str = "Evidence-grounded synthesis"
+    output_role: Literal["deliverable", "supporting"] = "deliverable"
 
 
 class Plan(Contract):
     questions: list[str] = Field(min_length=1, max_length=8)
     tasks: list[ResearchTask] = Field(min_length=1, max_length=8)
     rationale: str
+    intent: ResearchIntent | None = None
 
     @model_validator(mode="after")
     def valid_dag(self):
@@ -118,15 +212,25 @@ class SourceVersion(Contract):
     retrieved_at: datetime = Field(default_factory=now)
     provenance_cluster: str
     warnings: list[str] = Field(default_factory=list)
+    parse_status: Literal["ready", "fallback", "failed"] = "ready"
+    parser_capabilities: list[str] = Field(default_factory=lambda: ["text", "locators"])
 
 
 class TextBlock(Contract):
+    id: str | None = None
     text: str
     start: int
     end: int
     page: int | None = None
     bbox: tuple[float, float, float, float] | None = None
-    kind: Literal["paragraph", "page", "table"] = "paragraph"
+    kind: Literal[
+        "heading", "paragraph", "page", "list", "code", "table", "formula", "figure", "caption"
+    ] = "paragraph"
+    section_path: list[str] = Field(default_factory=list)
+    extraction_method: Literal["native", "ocr", "layout", "formula_recognition", "vision"] = "native"
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    table_cells: list[dict[str, Any]] = Field(default_factory=list)
+    crop_key: str | None = None
 
 
 class ParsedDocument(Contract):
@@ -134,6 +238,8 @@ class ParsedDocument(Contract):
     text: str
     blocks: list[TextBlock]
     warnings: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=lambda: ["text", "locators"])
+    reading_order_version: str = "native-v1"
 
 
 class EvidenceSpan(Contract):
@@ -146,6 +252,59 @@ class EvidenceSpan(Contract):
     quote_hash: str
     page: int | None = None
     bbox: tuple[float, float, float, float] | None = None
+    block_id: str | None = None
+    element_kind: str = "paragraph"
+    extraction_method: Literal["native", "ocr", "layout", "formula_recognition", "vision"] = "native"
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    crop_key: str | None = None
+
+
+class SourceIndexStatus(Contract):
+    source_id: str
+    parsed_hash: str
+    status: Literal["pending", "processing", "lexical_ready", "ready", "failed"] = "pending"
+    total_chunks: int = 0
+    embedded_chunks: int = 0
+    chunker_version: str = "locator-chunks-v1"
+    embedding_model: str | None = None
+    embedding_revision: str | None = None
+    error: str | None = None
+
+
+class RetrievalHit(Contract):
+    source_id: str
+    chunk_id: str
+    title: str = ""
+    start: int = Field(ge=0)
+    end: int = Field(gt=0)
+    page: int | None = None
+    kind: str = "paragraph"
+    snippet: str
+    score_details: dict[str, float] = Field(default_factory=dict)
+    evidence: Literal[False] = False
+
+
+class UploadStatus(Contract):
+    upload_id: str
+    status: Literal["pending", "processing", "ready", "failed"]
+    source_id: str | None = None
+    error: str | None = None
+    progress: float = Field(default=0, ge=0, le=1)
+
+
+class DerivedArtifact(Contract):
+    id: str
+    source_id: str
+    kind: Literal["figure_description", "chart_extraction"]
+    text: str
+    page: int | None = None
+    bbox: tuple[float, float, float, float] | None = None
+    crop_key: str | None = None
+    crop_hash: str | None = None
+    model: str
+    model_revision: str
+    prompt_version: str
+    attribution: Literal["system_inferred"] = "system_inferred"
 
 
 class Claim(Contract):
@@ -223,6 +382,30 @@ class PaperUnderstanding(Contract):
     reproduction_status: Literal["not_executed"] = "not_executed"
 
 
+class IntroductionArgument(Contract):
+    context: str
+    gap: str
+    objective: str
+    rationale: str
+    significance: str
+    hypotheses: list[str] = Field(default_factory=list, max_length=8)
+    claim_ids: list[str] = Field(default_factory=list)
+
+
+class ExperimentPlan(Contract):
+    id: str
+    hypothesis: str
+    dataset: str
+    baselines: list[str] = Field(min_length=1, max_length=12)
+    protocol: str
+    metrics: list[str] = Field(min_length=1, max_length=12)
+    analysis_plan: str
+    risks: list[str] = Field(default_factory=list, max_length=12)
+    execution_status: Literal["not_executed", "planned", "executed", "blocked"]
+    artifact_ids: list[str] = Field(default_factory=list)
+    claim_ids: list[str] = Field(default_factory=list)
+
+
 class ReportNode(Contract):
     id: str
     kind: Literal["section", "paragraph", "comparison_table"]
@@ -232,12 +415,21 @@ class ReportNode(Contract):
     rows: list[dict[str, str]] = Field(default_factory=list)
     cell_claim_ids: dict[str, list[str]] = Field(default_factory=dict)
     attribution: Literal["source_statement", "inference", "hypothesis", "guidance"] = "source_statement"
+    stage: ResearchStage | None = None
+    output_mode: Literal[
+        "evidence_synthesis", "research_proposal", "experiment_plan", "experiment_result", "guidance"
+    ] = "evidence_synthesis"
+    execution_status: Literal["not_applicable", "not_executed", "planned", "executed", "blocked"] = (
+        "not_applicable"
+    )
 
 
 class ReportDraft(Contract):
     title: str
     nodes: list[ReportNode] = Field(min_length=1, max_length=40)
     paper: PaperUnderstanding | None = None
+    introduction: IntroductionArgument | None = None
+    experiments: list[ExperimentPlan] = Field(default_factory=list, max_length=8)
     unresolved: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -250,6 +442,8 @@ class ReportDraft(Contract):
 class ReportPatch(Contract):
     replacements: list[ReportNode] = Field(default_factory=list)
     paper: PaperUnderstanding | None = None
+    introduction: IntroductionArgument | None = None
+    experiments: list[ExperimentPlan] | None = None
     unresolved: list[str] = Field(default_factory=list)
 
 

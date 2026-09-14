@@ -5,8 +5,11 @@ from pydantic import ValidationError
 from reportlab.pdfgen.canvas import Canvas
 
 from research_agent.context import build_context
-from research_agent.contracts import Plan, ResearchBrief, RunProfile
+from research_agent.contracts import Plan, ResearchBrief, ResearchIntent, RunProfile
+from research_agent.evidence import EvidenceService
 from research_agent.fetch import UnsafeURL, resolve_public
+from research_agent.intake import extract_urls
+from research_agent.parser_service import parse_isolated
 from research_agent.parsing import parse_document
 from research_agent.providers import DeepSeekProvider, ProviderError
 from research_agent.settings import Settings
@@ -26,6 +29,82 @@ def test_plan_rejects_cycle_and_unknown_dependencies():
                     "depends_on": ["b"],
                     "acceptance_criteria": ["evidence"],
                 }
+            ],
+        )
+
+
+def test_free_form_input_extracts_urls_without_trailing_punctuation():
+    text = "先读 https://example.com/paper.pdf，再参考（https://arxiv.org/abs/1234.5678）。"
+    assert extract_urls(text) == ["https://example.com/paper.pdf", "https://arxiv.org/abs/1234.5678"]
+
+
+def test_research_intent_rejects_duplicate_paper_stages():
+    stage = {
+        "stage": "introduction",
+        "role": "deliverable",
+        "objective": "Find a defensible research gap",
+        "methods": ["gap_analysis"],
+        "deliverable": "Introduction argument",
+        "reason": "The user asked AI to propose a direction",
+    }
+    with pytest.raises(ValidationError, match="stages must be unique"):
+        ResearchIntent(
+            normalized_question="Identify a new direction grounded in prior work",
+            mode="research_design",
+            stages=[stage, stage],
+        )
+
+
+def test_research_intent_supporting_modules_form_a_dependency_dag():
+    intent = ResearchIntent(
+        normalized_question="Design a method grounded in weaknesses of existing work",
+        mode="research_design",
+        stages=[
+            {
+                "stage": "related_work",
+                "role": "supporting",
+                "objective": "Find baselines and limitations",
+                "methods": ["literature_search"],
+                "deliverable": "Internal evidence matrix",
+                "reason": "The method needs evidence-backed design requirements",
+            },
+            {
+                "stage": "methodology",
+                "role": "deliverable",
+                "objective": "Design the requested method",
+                "methods": ["gap_analysis"],
+                "deliverable": "Method specification",
+                "reason": "This is the user's requested output",
+                "depends_on": ["related_work"],
+            },
+        ],
+    )
+    assert intent.stages[0].role == "supporting"
+    assert intent.stages[1].depends_on == ["related_work"]
+
+
+def test_research_intent_rejects_orphan_supporting_module():
+    with pytest.raises(ValidationError, match="not required by a deliverable"):
+        ResearchIntent(
+            normalized_question="Draft only a conclusion from supplied evidence",
+            mode="research_design",
+            stages=[
+                {
+                    "stage": "related_work",
+                    "role": "supporting",
+                    "objective": "Unused survey",
+                    "methods": ["literature_search"],
+                    "deliverable": "Internal notes",
+                    "reason": "No downstream dependency",
+                },
+                {
+                    "stage": "conclusion",
+                    "role": "deliverable",
+                    "objective": "Answer the question",
+                    "methods": ["source_synthesis"],
+                    "deliverable": "Conclusion",
+                    "reason": "Requested output",
+                },
             ],
         )
 
@@ -78,6 +157,42 @@ def test_pdf_pages_have_stable_offsets():
     assert [b.page for b in doc.blocks] == [1, 2]
     assert all(doc.text[b.start : b.end] == b.text for b in doc.blocks)
     assert "not evaluated" in doc.blocks[1].text
+
+
+async def test_auto_pdf_parser_explicitly_marks_native_fallback():
+    data = io.BytesIO()
+    pdf = Canvas(data)
+    pdf.drawString(50, 700, "Fallback remains evidence preserving.")
+    pdf.save()
+    doc = await parse_isolated(
+        data.getvalue(),
+        "application/pdf",
+        "fallback",
+        Settings(parser_url=None, request_timeout=10, _env_file=None),
+        "auto",
+    )
+    assert "Fallback remains evidence preserving" in doc.text
+    assert "enhanced parser fallback" in doc.warnings
+
+
+async def test_visual_pdf_blocks_receive_private_crop_artifacts():
+    class Store:
+        saved = []
+
+        async def put(self, tenant, data, kind, content_type):
+            self.saved.append((tenant, data, kind, content_type))
+            return f"{tenant}/{kind}/crop-hash"
+
+    data = io.BytesIO()
+    pdf = Canvas(data)
+    pdf.drawString(50, 700, "OCR text")
+    pdf.save()
+    doc = parse_document(data.getvalue(), "application/pdf")
+    doc.blocks[0].extraction_method = "ocr"
+    store = Store()
+    await EvidenceService(None, store, "tenant-a")._attach_visual_crops(data.getvalue(), doc)
+    assert doc.blocks[0].crop_key == "tenant-a/visual-crop/crop-hash"
+    assert store.saved[0][1].startswith(b"\x89PNG")
 
 
 def test_two_column_pdf_preserves_content_flow_and_verbatim_passages():

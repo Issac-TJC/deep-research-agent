@@ -89,10 +89,18 @@ async def runs(tenant: Tenant, service: Service):
 async def run(run_id: UUID, tenant: Tenant, service: Service):
     result = await service.db.run(tenant, str(run_id))
     result["tasks"] = await service.db.records(tenant, str(run_id), "task")
-    result["sources"] = [r["source"] for r in await service.db.records(tenant, str(run_id), "source_ref")]
+    result["sources"] = [
+        {
+            **record["source"],
+            "index": await service.db.index_status(tenant, record["source"]["id"]),
+        }
+        for record in await service.db.records(tenant, str(run_id), "source_ref")
+    ]
     result["reviews"] = await service.db.records(tenant, str(run_id), "review")
     result["contexts"] = await service.db.records(tenant, str(run_id), "context")
     result["warnings"] = await service.db.records(tenant, str(run_id), "warning")
+    intents = await service.db.records(tenant, str(run_id), "intent")
+    result["intent"] = intents[-1] if intents else None
     return result
 
 
@@ -164,25 +172,58 @@ async def events(
     )
 
 
-@app.post("/uploads", status_code=201)
-async def upload(tenant: Tenant, service: Service, file: UploadFile = File()):
+@app.post("/uploads")
+async def upload(
+    tenant: Tenant,
+    service: Service,
+    file: UploadFile = File(),
+    parser_mode: str = Query("auto", pattern="^(native|auto|enhanced)$"),
+):
     filename = os.path.basename(file.filename or "upload")[:200]
     mime = file.content_type or ""
     if filename.lower().endswith(".md"):
         mime = "text/markdown"
     if mime not in {"text/html", "text/plain", "text/markdown", "application/pdf"}:
-        raise HTTPException(415, "Supported: HTML, text PDF, Markdown")
+        raise HTTPException(415, "Supported: HTML, PDF, Markdown, plain text")
     raw = await file.read(service.db.settings.max_upload_bytes + 1)
     if len(raw) > service.db.settings.max_upload_bytes:
         raise HTTPException(413, "Upload too large")
-    source = await service.upload(tenant, raw, mime, filename)
-    return {"upload_id": source.id, "source": source}
+    if mime == "application/pdf" and parser_mode != "native":
+        pending = await service.start_upload(tenant, raw, mime, filename, parser_mode)
+        state = await service.wait_upload(
+            tenant, pending.upload_id, service.db.settings.index_wait_seconds
+        )
+        if state.status == "ready" and state.source_id:
+            src = await service.db.get(tenant, state.source_id, "source")
+            index = await service.db.index_status(tenant, state.source_id)
+            return JSONResponse(
+                jsonable_encoder({"upload_id": state.upload_id, "source": src, "index": index}),
+                status_code=201,
+            )
+        if state.status == "failed":
+            return JSONResponse(jsonable_encoder(state), status_code=422)
+        return JSONResponse(jsonable_encoder(state), status_code=202)
+    source = await EvidenceService(service.db, service.store, tenant).ingest(
+        raw, mime, filename, filename=filename, parser_mode=parser_mode
+    )
+    index = await service.db.index_status(tenant, source.id)
+    return JSONResponse(
+        jsonable_encoder({"upload_id": source.id, "source": source, "index": index}),
+        status_code=201,
+    )
+
+
+@app.get("/uploads/{upload_id}")
+async def upload_status(upload_id: UUID, tenant: Tenant, service: Service):
+    return await service.upload_state(tenant, str(upload_id))
 
 
 @app.get("/sources/{source_id}")
 async def source(source_id: UUID, tenant: Tenant, service: Service):
     src, document = await EvidenceService(service.db, service.store, tenant).document(str(source_id))
-    return {"source": src, "document": document}
+    index = await service.db.index_status(tenant, str(source_id))
+    artifacts = await service.db.source_artifacts(tenant, str(source_id))
+    return {"source": src, "document": document, "index": index, "artifacts": artifacts}
 
 
 @app.get("/sources/{source_id}/raw")
@@ -204,6 +245,19 @@ async def source_raw(source_id: UUID, tenant: Tenant, service: Service):
 @app.get("/evidence-spans/{span_id}")
 async def span(span_id: UUID, tenant: Tenant, service: Service):
     return await service.db.get(tenant, str(span_id), "span")
+
+
+@app.get("/evidence-spans/{span_id}/crop")
+async def span_crop(span_id: UUID, tenant: Tenant, service: Service):
+    evidence = await service.db.get(tenant, str(span_id), "span")
+    if not evidence.get("crop_key"):
+        raise NotFound("visual crop unavailable")
+    raw = await service.store.get(tenant, evidence["crop_key"])
+    return Response(
+        raw,
+        media_type="image/png",
+        headers={"Cache-Control": "private, immutable", "X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.get("/research-runs/{run_id}/report")

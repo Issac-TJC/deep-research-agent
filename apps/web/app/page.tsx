@@ -11,6 +11,7 @@ const templates = {
 const terminal = new Set(["completed", "failed", "cancelled", "interrupted"]);
 const phaseNames: Dict = {
   intake: "整理输入",
+  scoping: "理解研究意图",
   planning: "制定计划",
   research: "检索与研读",
   review: "审查证据",
@@ -19,6 +20,23 @@ const phaseNames: Dict = {
   citation_check: "核对引用",
   starting: "开始研究",
   recovering: "恢复运行",
+};
+const stageNames: Dict = {
+  introduction: "Introduction / 问题与意义",
+  related_work: "Related Work / 相关工作",
+  methodology: "Method / 方法",
+  experiment: "Experiment / 实验",
+  results: "Results / 结果",
+  discussion: "Discussion / 讨论",
+  conclusion: "Conclusion / 结论",
+};
+const parseLabels: Dict = { ready: "解析完成", fallback: "降级", failed: "失败" };
+const indexLabels: Dict = {
+  pending: "解析中",
+  processing: "解析中",
+  lexical_ready: "词法可用",
+  ready: "混合检索可用",
+  failed: "失败",
 };
 async function api(path: string, init?: RequestInit) {
   const r = await fetch("/api/backend" + path, init);
@@ -41,12 +59,7 @@ export default function Home() {
   const [report, setReport] = useState<Dict | null>(null);
   const [usage, setUsage] = useState<Dict[]>([]);
   const [events, setEvents] = useState<Dict[]>([]);
-  const [template, setTemplate] = useState<keyof typeof templates>(
-    "technical_comparison",
-  );
   const [question, setQuestion] = useState("");
-  const [constraints, setConstraints] = useState("");
-  const [urls, setUrls] = useState("");
   const [uploads, setUploads] = useState<Dict[]>([]);
   const [tab, setTab] = useState("report");
   const [selected, setSelected] = useState<Dict | null>(null);
@@ -158,9 +171,7 @@ export default function Home() {
         body: JSON.stringify({
           brief: {
             question,
-            template,
-            constraints: constraints.split("\n").filter(Boolean),
-            source_urls: urls.split("\n").filter(Boolean),
+            template: "general_research",
             upload_ids: uploads.map((x) => x.upload_id),
           },
         }),
@@ -179,8 +190,34 @@ export default function Home() {
     try {
       const body = new FormData();
       body.append("file", file);
-      const item = await api("/uploads", { method: "POST", body });
-      setUploads((old) => [...old, item]);
+      let item = await api("/uploads", { method: "POST", body });
+      setUploads((old) => [...old, { ...item, filename: file.name }]);
+      while (!item.source && !["failed"].includes(item.status)) {
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        const state = await api(`/uploads/${item.upload_id}`);
+        setUploads((old) =>
+          old.map((entry) =>
+            entry.upload_id === item.upload_id ? { ...entry, ...state } : entry,
+          ),
+        );
+        if (state.status === "ready" && state.source_id) {
+          const loaded = await api(`/sources/${state.source_id}`);
+          item = {
+            upload_id: item.upload_id,
+            status: "ready",
+            source: loaded.source,
+            index: loaded.index,
+          };
+          setUploads((old) =>
+            old.map((entry) =>
+              entry.upload_id === item.upload_id ? { ...entry, ...item } : entry,
+            ),
+          );
+          break;
+        }
+        if (state.status === "failed") throw Error(state.error || "文档解析失败");
+        item = { ...item, ...state };
+      }
     } catch (e) {
       setError(String(e));
     } finally {
@@ -313,63 +350,28 @@ export default function Home() {
         ) : !active ? (
           <section className="new-research">
             <div className="intro">
-              <h2>让复杂资料成为清晰判断。</h2>
+              <h2>把问题、链接和材料都交给研究 Agent。</h2>
               <p>
-                比较技术方案，读懂论文，找到值得继续研究的问题。每项结论都能回到原始材料。
+                不必先选择研究类型。系统会判断你需要 Introduction、Related Work、方法设计还是实验方案，并为每部分选择合适的做法。
               </p>
               <div className="features">
-                <span>01 明确问题</span>
-                <span>02 阅读与补证</span>
-                <span>03 形成研究包</span>
+                <span>01 理解意图</span>
+                <span>02 编排研究</span>
+                <span>03 形成论文工作包</span>
               </div>
             </div>
             <form className="panel research-form" onSubmit={create}>
               <label>
-                研究类型
-                <select
-                  value={template}
-                  onChange={(e) =>
-                    setTemplate(e.target.value as keyof typeof templates)
-                  }
-                >
-                  {Object.entries(templates).map(([id, name]) => (
-                    <option key={id} value={id}>
-                      {name}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label>
-                你想弄清楚什么？
+                你想完成什么研究？
                 <textarea
                   required
                   minLength={8}
                   value={question}
                   onChange={(e) => setQuestion(e.target.value)}
-                  rows={4}
-                  placeholder="为中文技术知识库比较关键词、向量、混合检索与重排，重点考虑错误码精确查找、长文档和运行成本。"
+                  rows={8}
+                  placeholder={"直接描述目标，也可以把链接贴在这里。例如：\n读这篇论文并找出可改进之处；先梳理相关工作，再用“现有不足—要做什么—为什么有意义”的 Introduction 结构提出三个切入点。\nhttps://…"}
                 />
               </label>
-              <div className="form-grid">
-                <label>
-                  约束与比较维度 · 每行一项
-                  <textarea
-                    value={constraints}
-                    onChange={(e) => setConstraints(e.target.value)}
-                    rows={3}
-                    placeholder="保留错误码字面匹配\n区分不同测试条件的性能数据"
-                  />
-                </label>
-                <label>
-                  优先阅读的公开链接 · 每行一项
-                  <textarea
-                    value={urls}
-                    onChange={(e) => setUrls(e.target.value)}
-                    rows={3}
-                    placeholder="https://…"
-                  />
-                </label>
-              </div>
               <div className="upload-zone">
                 <label className="upload-button">
                   ＋ 添加 PDF / Markdown / HTML
@@ -382,10 +384,10 @@ export default function Home() {
                     }
                   />
                 </label>
-                <small>文本型 PDF · 单文件最多 20 MB</small>
+                <small>PDF 支持本地 OCR / 表格 / 公式 / 图片解析 · 单文件最多 20 MB</small>
                 {uploads.map((x) => (
                   <span className="chip" key={x.upload_id}>
-                    {x.source.filename}
+                    {x.source?.filename || x.filename || "上传文件"} · {x.source ? "解析完成" : x.status || "解析中"}
                     <button
                       type="button"
                       aria-label="移除文件"
@@ -399,8 +401,11 @@ export default function Home() {
                 ))}
               </div>
               <footer>
-                <small>生成研究报告、引用证据和运行记录</small>
-                <button className="primary" disabled={busy}>
+                <small>AI 自动识别问题、URL 与参考文件；所有外部结论保留证据引用</small>
+                <button
+                  className="primary"
+                  disabled={busy || uploads.some((item) => !item.source)}
+                >
                   {busy ? "处理中…" : "开始研究 →"}
                 </button>
               </footer>
@@ -458,13 +463,44 @@ export default function Home() {
                   <strong>{run.sources.length}</strong>
                 </div>
               </section>
+              {run.intent && (
+                <section className="intent-board panel">
+                  <div>
+                    <small>AI RESEARCH BRIEF · {run.intent.mode}</small>
+                    <h3>{run.intent.normalized_question}</h3>
+                  </div>
+                  <div className="intent-stages">
+                    {run.intent.stages.map((item: Dict) => (
+                      <article key={item.stage}>
+                        <span className={item.role === "supporting" ? "chip support" : "chip"}>
+                          {stageNames[item.stage] || item.stage} · {item.role === "supporting" ? "内部支撑" : "最终交付"}
+                        </span>
+                        <strong>{item.deliverable}</strong>
+                        <p>{item.objective}</p>
+                        <small>{item.methods.join(" · ")}</small>
+                        {item.depends_on?.length > 0 && (
+                          <small className="dependency">
+                            依赖：{item.depends_on.map((x: string) => stageNames[x] || x).join("、")}
+                          </small>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                  {run.intent.capability_gaps?.length > 0 && (
+                    <p className="capability-gap">
+                      当前能力边界：{run.intent.capability_gaps.join("；")}
+                    </p>
+                  )}
+                </section>
+              )}
               <section className="tasks">
                 {run.tasks.map((t: Dict) => (
                   <article key={t.id}>
                     <small>
-                      {t.execution_status} · {t.acceptance}
+                      {stageNames[t.stage] || t.stage} · {t.output_role === "supporting" ? "内部支撑" : "最终交付"} · {t.method}
                     </small>
                     <h3>{t.objective}</h3>
+                    <p>{t.deliverable}</p>
                     {t.stop_reason && <p>{t.stop_reason}</p>}
                   </article>
                 ))}
@@ -504,8 +540,45 @@ export default function Home() {
                           </a>
                         </div>
                         <h2>{report.report.title}</h2>
+                        {report.report.introduction && (
+                          <section className="structured-block">
+                            <span className="chip">Introduction / 论证链</span>
+                            {[
+                              ["研究背景", "context"],
+                              ["现有不足", "gap"],
+                              ["要做什么", "objective"],
+                              ["为什么这样做", "rationale"],
+                              ["研究意义", "significance"],
+                            ].map(([label, key]) => (
+                              <div key={key}>
+                                <h3>{label}</h3>
+                                <p>{report.report.introduction[key]}</p>
+                              </div>
+                            ))}
+                            {report.report.introduction.hypotheses?.length > 0 && (
+                              <>
+                                <h3>可检验假设</h3>
+                                <ul>
+                                  {report.report.introduction.hypotheses.map((x: string) => (
+                                    <li key={x}>{x}</li>
+                                  ))}
+                                </ul>
+                              </>
+                            )}
+                            {citations(report.report.introduction.claim_ids)}
+                          </section>
+                        )}
                         {report.report.nodes.map((n: Dict) => (
                           <section key={n.id}>
+                            {n.stage && (
+                              <div className="node-meta">
+                                <span className="chip">{stageNames[n.stage] || n.stage}</span>
+                                <small>
+                                  {n.output_mode}
+                                  {n.execution_status !== "not_applicable" && ` · ${n.execution_status}`}
+                                </small>
+                              </div>
+                            )}
                             {n.title && <h3>{n.title}</h3>}
                             <p>{n.text}</p>
                             {n.rows?.length > 0 && (
@@ -539,6 +612,25 @@ export default function Home() {
                             {citations(n.claim_ids)}
                           </section>
                         ))}
+                        {report.report.experiments?.length > 0 && (
+                          <section className="structured-block">
+                            <h2>Experiment / 实验工作包</h2>
+                            {report.report.experiments.map((x: Dict) => (
+                              <article className="idea" key={x.id}>
+                                <span className="chip">{x.execution_status}</span>
+                                <h3>{x.hypothesis}</h3>
+                                <p><b>数据：</b>{x.dataset}</p>
+                                <p><b>基线：</b>{x.baselines.join(" · ")}</p>
+                                <p><b>协议：</b>{x.protocol}</p>
+                                <p><b>指标：</b>{x.metrics.join(" · ")}</p>
+                                <p><b>分析：</b>{x.analysis_plan}</p>
+                                {x.risks?.length > 0 && <p><b>风险：</b>{x.risks.join("；")}</p>}
+                                {x.artifact_ids?.length > 0 && <p><b>运行产物：</b>{x.artifact_ids.join(" · ")}</p>}
+                                {citations(x.claim_ids)}
+                              </article>
+                            ))}
+                          </section>
+                        )}
                         {report.report.paper && (
                           <section className="paper">
                             <h2>读懂论文</h2>
@@ -664,6 +756,11 @@ export default function Home() {
                           </small>
                           <h3>{s.title}</h3>
                           <p>{s.url || s.filename}</p>
+                          <span>
+                            解析：{parseLabels[s.parse_status] || "解析完成"} · 索引：{indexLabels[s.index?.status] || "解析中"}
+                            {s.index?.total_chunks > 0 &&
+                              ` · ${s.index.embedded_chunks}/${s.index.total_chunks}`}
+                          </span>
                           <span>{s.warnings.join(" · ")}</span>
                         </button>
                       ))}
@@ -726,8 +823,18 @@ export default function Home() {
                     {selected.span && (
                       <div className="locator">
                         第 {selected.span.page || "—"} 页 · 字符{" "}
-                        {selected.span.start}–{selected.span.end}
+                        {selected.span.start}–{selected.span.end} · {selected.span.element_kind || "paragraph"} · {selected.span.extraction_method || "native"}
+                        {selected.span.confidence != null &&
+                          ` · 置信度 ${(selected.span.confidence * 100).toFixed(0)}%`}
+                        {selected.span.extraction_method === "vision" && " · 系统推断"}
                       </div>
+                    )}
+                    {selected.span?.crop_key && (
+                      <img
+                        className="evidence-crop"
+                        src={`/api/backend/evidence-spans/${selected.span.id}/crop`}
+                        alt="证据所在的 PDF 原始区域"
+                      />
                     )}
                     <pre>
                       {selected.span ? (
