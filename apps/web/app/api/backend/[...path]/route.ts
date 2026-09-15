@@ -17,9 +17,20 @@ async function proxy(
   const { path } = await context.params;
   if (
     !path.length ||
-    !["research-runs", "uploads", "sources", "evidence-spans"].includes(
-      path[0],
-    ) ||
+    ![
+      "research-runs",
+      "uploads",
+      "sources",
+      "evidence-spans",
+      "projects",
+      "conversations",
+      "users",
+      "subscriptions",
+      "digests",
+      "notifications",
+      "memory-jobs",
+      "health",
+    ].includes(path[0]) ||
     path.some((x) => !/^[-a-zA-Z0-9]+$/.test(x))
   )
     return new Response("Not found", { status: 404 });
@@ -67,7 +78,11 @@ async function proxy(
       },
     );
     const resultHeaders = new Headers({ "Cache-Control": "no-store" });
-    for (const name of ["content-type", "content-disposition"]) {
+    for (const name of [
+      "content-type",
+      "content-disposition",
+      "x-next-cursor",
+    ]) {
       const value = response.headers.get(name);
       if (value) resultHeaders.set(name, value);
     }
@@ -79,4 +94,4 @@ async function proxy(
     return new Response("Backend unavailable", { status: 503 });
   }
 }
-export { proxy as GET, proxy as POST };
+export { proxy as DELETE, proxy as GET, proxy as PATCH, proxy as POST };

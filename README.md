@@ -2,7 +2,9 @@
 
 一个证据优先、可恢复、受预算约束的多 Agent 深度研究工作台。系统把研究意图编译成任务 DAG，在授权来源内检索与阅读，生成可定位的 Claim / EvidenceSpan，经审查和写作后交付带引用的结构化报告。
 
-当前版本：**v0.2.0（2026-09-14）**。
+当前版本：**v0.4.0-rc.1（2026-09-15）**。
+
+v0.4.0-rc.1 完成 PRD 的 P0/MVP，并加入 EvoMemory v2：消息、助手占位和 Run 原子创建，创建类接口统一幂等；删除项目立即隐藏全部子资源并保留 30 天恢复期；会话使用闭合协议语义摘要、PostgreSQL checkpoint、受治理 Profile 与 Observation；项目记忆采用全文、精确和向量检索的 RRF 融合。论文周报直接接入 OpenAlex、Crossref、arXiv 和 PubMed，保存候选、跨平台 provenance、分项评分、证据范围、连接器尝试与站内通知。旧 `/research-runs`、历史报告和证据链保持兼容。
 
 v0.2.0 的重点不是增加更多 Agent，而是让现有协作链在真实运行中可控收口：跨轮对话改为紧凑进度 capsule、token 按阶段保留、非法补证不再导致 Run 崩溃、Embedding 可在离线容器中稳定启动，并且即使研究或审查预算耗尽，也会经过质量门禁生成可解释的 `needs_review` 报告。
 
@@ -19,6 +21,38 @@ v0.2.0 的重点不是增加更多 Agent，而是让现有协作链在真实运�
 - PostgreSQL 持久化队列、租约、fencing token、父图/子图 checkpoint、动作账本、预算和 SSE 事件。
 - 工作台展示计划、任务、来源、引用、报告、用量、缓存命中、阶段预算和降级原因。
 - 支持两租户 RLS 隔离、私有 MinIO 工件、受限公网抓取和离线 Parser / Embedding 容器。
+- 以 `Project → Conversation → Message → Research Run` 组织持续研究；项目资产、记忆、画像信号和订阅均受同一租户 RLS 边界保护。
+- 支持项目内统一搜索、候选记忆确认/拒绝、画像学习独立开关，以及获取真实元数据候选的每周论文订阅。
+- 支持快速回答与深度研究两种消息模式、会话 SSE 断线补读、稳定列表游标、通知已读和待核验周报人工发布。
+
+## 项目化工作流
+
+1. 创建项目，填写研究目标、标签和排除项；系统同时创建默认对话，并把显式目标写入已确认项目记忆。
+2. 上传 PDF、Markdown、HTML 或文本到项目资产池；启动 Run 时冻结可用的 `source_version_id` 集合。
+3. 在同一项目内建立多个对话。每轮 Run 自动装配最近闭合消息、已确认项目记忆、相关画像信号和项目来源。
+4. Run 完成后生成可追溯的候选结论记忆，用户可在项目记忆页确认或拒绝。
+5. 创建论文周报订阅并试运行查询。预览实际获取并保存论文元数据候选，但不进入正式的八周去重窗口；“立即生成周报”按订阅本地周期幂等创建 `paper_review` Run，完成后按质量门禁进入 `published` 或 `needs_review`。
+
+### EvoMemory v2 混合记忆
+
+新建数据使用 v2 读取链路；迁移前的摘要、项目记忆和画像保留为 `legacy`，可查看但不会自动进入模型上下文，也不进行双写或历史回填。
+
+- `messages` 仍是会话事实源；`conversation:{conversation_id}:v2` LangGraph PostgreSQL checkpoint 只保存可重建的会话运行状态。
+- 每次装配按 `min(24k, prompt limit × 20%)` 分配最近六轮、累计语义摘要、已确认项目知识、已确认 Observation 和 active Profile；实际注入 ID、hash、分数与预算省略原因进入 Run 快照。
+- Profile 分为 `assistant_style`、`user_profile`、`research_taste` 和 `project_profile`。Observation 分为 semantic、procedural、episodic，可处于项目或当前用户全局作用域，并支持 complements、contradicts、supersedes 关系。
+- 自动蒸馏只在用户显式开启长期学习后运行，所有产物先进入 candidate；拒绝或未确认内容不自动注入。对话语义压缩不受长期学习开关影响。
+- 同一 Conversation 只允许一个 queued/running Run。记忆任务独立重试并进入 dead letter，不改变研究报告的完成状态。
+- Agent 可用 `search_memory` / `read_memory` 精读候选，但这些内容只是规划线索，不能替代原始来源和 Claim/EvidenceSpan 引用。
+
+记忆页提供“项目知识、Profile、Observations、待确认”四个视图；`POST /conversations/{id}/compact` 可手动入队压缩，`GET /conversations/{id}/memory-state` 可查看版本、revision、摘要和后台任务。
+
+自动排程是可选 Compose profile；开启后会按订阅时区和星期补跑本周尚未创建的任务，同一订阅同一周期不会重复入队：
+
+```sh
+docker compose --profile automation up -d digest-scheduler
+```
+
+论文候选通过 OpenAlex、Crossref、arXiv 和 PubMed 官方公开接口独立获取；单个平台超时不会中止其他平台。arXiv 请求全局串行且至少间隔 3 秒，PubMed 无密钥时限制到每秒 3 请求以内。默认测试使用冻结 fixture，不访问外网或付费模型。
 
 ## 执行流程
 
@@ -121,6 +155,8 @@ docker compose run --rm -T migrate research seed > .local/test-tenants.jsonl
 chmod 600 .local/test-tenants.jsonl
 ```
 
+上述命令会把当前同名 Compose 栈切换到合成测试模式。测试结束后必须执行下方 live 启动命令重新创建 API、Worker 和 Indexer；仅刷新页面或重启旧容器不会改变已经冻结的环境变量。工作台会持续显示“合成测试模式”或“真实研究模式”，历史 fixture Run 也会保留合成标记。
+
 首次构建 Parser / Embedding 会下载并 warm-load 锁定模型，通常明显慢于后续构建。启动完成后打开 <http://localhost:13000>，使用 `.local/test-tenants.jsonl` 中的一条 `api_key` 登录。该 Key 是本项目的租户凭证，不是 DeepSeek / Tavily Key；不要提交或公开。
 
 | 服务 | 地址 |
@@ -153,6 +189,9 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-flash
 DEEPSEEK_THINKING=enabled
 DEEPSEEK_EFFORT=low
+MEMORY_API_KEY=<independent-memory-model-key>
+MEMORY_BASE_URL=https://api.deepseek.com
+MEMORY_MODEL=<independent-memory-model>
 LIVE_CAMPAIGN_USD=10
 ```
 
@@ -208,6 +247,20 @@ make web
 | `GET /sources/{id}`、`/raw` | 来源元数据和受保护原文 |
 | `GET /evidence-spans/{id}`、`/crop` | 引用片段和可用视觉 crop |
 | `GET /research-runs/{id}/report` | 研究包或指定 revision |
+| `POST /projects`、`GET /projects` | 创建、筛选和列出项目 |
+| `GET/PATCH/DELETE /projects/{id}` | 项目详情、编辑、归档与 30 天软删除 |
+| `POST/GET /projects/{id}/conversations` | 创建和列出项目对话 |
+| `POST /conversations/{id}/messages` | 发送消息并按需创建项目内 Run |
+| `GET /conversations/{id}/memory-state`、`POST /compact` | 查看 v2 会话状态并手动入队语义压缩 |
+| `POST/GET /projects/{id}/artifacts` | 管理项目长期资产池 |
+| `POST /projects/{id}/search` | 搜索文件、消息、记忆、Claim、报告和周报 |
+| `GET/POST/PATCH /projects/{id}/memories` | 查看、创建、确认或拒绝项目记忆 |
+| `GET/POST/PATCH /projects/{id}/observations` | 管理 semantic / procedural / episodic Observation |
+| `GET /memory-jobs/{id}` | 查看记忆蒸馏、关联或 embedding 任务 |
+| `GET/PATCH /users/me/research-profile` | 查看和控制研究画像 |
+| `POST/GET /projects/{id}/subscriptions` | 创建和列出论文周报订阅 |
+| `POST /subscriptions/{id}/preview` | 生成不调用外部平台的试运行查询快照 |
+| `POST /subscriptions/{id}/run` | 幂等创建本周期周报研究任务 |
 
 接口契约以运行中的 OpenAPI 和 `src/research_agent/contracts.py` 为准。
 
@@ -226,8 +279,8 @@ RUN_INTEGRATION=1 .venv/bin/pytest -q
 docker compose config -q
 git diff --check
 
-# 完成后恢复服务
-docker compose up -d worker
+# 推荐：独立 PostgreSQL/MinIO，不会被常驻 Worker 抢占
+make integration-isolated
 ```
 
 前端与浏览器：
@@ -237,7 +290,7 @@ pnpm --dir apps/web build
 pnpm --dir apps/web exec playwright test
 ```
 
-当前 v0.2.0 工作树验证结果为 **72 passed**，并通过 Ruff、Compose 配置、前端构建、真实浏览器测试、Embedding 768 维离线健康检查和固定工具序列通信基准。真实 3DGS 修复后完整质量复测尚未执行，不能把工程回归写成研究质量提升。命令、Run ID 和未验证结论见 [验证结果](docs/verification-results.md)。
+RC 验证覆盖独立 PostgreSQL/MinIO 完整后端、迁移回滚/前进、容量门禁、Ruff、Compose、TypeScript、生产构建和浏览器流程。fixture 结果只证明工程闭环，不等于真实论文质量；连续四周 shadow 仍是升版 `v0.4.0` 的必要条件。精确结果见 [验证结果](docs/verification-results.md) 与 [PRD 可追踪矩阵](docs/prd-traceability-v0.4.0-rc.1.md)。
 
 ## 可靠性与安全边界
 
@@ -254,7 +307,7 @@ pnpm --dir apps/web exec playwright test
 - Reviewer 与 Writer 可能使用同一模型，存在相关性错误；`passed` 也不替代人工核验。
 - 搜索结果可能遇到反爬、导航页、客户端挑战或低质量聚合页；当前不会把抓取失败伪装成有效证据。
 - 新来源建立语义索引存在异步延迟；未 ready 时仅使用 lexical fallback，不等于 Embedding 服务故障。
-- 没有自动跨 Run 的用户画像/长期语义记忆、任意旧 checkpoint 迁移、SSO、对象 GC 或跨集群调度。
+- 自动长期记忆依赖独立辅助模型，尚未完成真实 heldout 的记忆召回质量评测；不迁移旧 checkpoint，也没有 SSO、对象 GC 或跨集群调度。
 - 系统不执行论文代码，不验证论文新颖性，也不能保证复杂 PDF、公式、OCR 和表格理解正确。
 
 ## 仓库导航
@@ -263,6 +316,7 @@ pnpm --dir apps/web exec playwright test
 |---|---|
 | `src/research_agent/graph.py` | 研究图、角色边界、预算收口和降级报告 |
 | `src/research_agent/context.py` | capsule、上下文装配、证据选择和 soft target |
+| `src/research_agent/memory.py` | 会话语义压缩、MemoryBroker、蒸馏/关联/embedding 后台任务 |
 | `src/research_agent/gateway.py` | 模型/工具动作、预留、结算和协议诊断 |
 | `src/research_agent/db.py` | RLS 数据访问、队列、索引、账本与 usage summary |
 | `src/research_agent/evidence.py` | 来源版本、passage、Claim / Span 和报告渲染 |
@@ -275,8 +329,18 @@ pnpm --dir apps/web exec playwright test
 进一步阅读：
 
 - [多 Agent Token 策略](docs/multi-agent-token-strategy.md)
+- [Multi-Agent 工程实现说明](docs/multi-agent-engineering.md)
 - [检索与解析](docs/retrieval-and-parsing.md)
 - [开发日志](docs/development-log.md)
 - [面试深挖：实现、事故与证据边界](docs/interview-deep-dive.md)
 - [验证结果](docs/verification-results.md)
 - [Research Agent V2 设计](docs/research-agent-v2-design.md)
+
+## 参考仓库
+
+以下仓库用于架构研究与实现取舍，本项目不依赖其运行时；详细映射见 [设计蓝图](docs/deep-research-agent-blueprint.md)。
+
+- [Hyperresearch（固定参考版本）](https://github.com/jordan-gibbs/hyperresearch/tree/cbaaaf7841e35005796d58e25dcac38fc9cf3326)
+- [OpenResearch（固定参考版本）](https://github.com/alphaXiv/OpenResearch/tree/3736d7e03842f572be417d2e4de79ed5b06ef012)
+- [HelloAgents DeepResearch（固定参考版本）](https://github.com/datawhalechina/hello-agents/tree/4f7682ceafe573d07cd8a7d0b89908500e83227d/code/chapter14/helloagents-deepresearch)
+- [DeerFlow（固定参考版本）](https://github.com/bytedance/deer-flow/tree/3f0b6ecc811190481897f1ed02c2ba0c1f69799e)

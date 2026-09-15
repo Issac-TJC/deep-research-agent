@@ -65,6 +65,8 @@ async def test_complete_research_templates(env, template):
         assert package.report.paper.reproduction_status == "not_executed"
     events = await db.events(tenant, str(run["id"]), 0)
     assert [e["seq"] for e in events] == list(range(1, len(events) + 1))
+    memories = await db.memories(tenant, str(final["project_id"]))
+    assert any(item["status"] == "candidate" and item["type"] == "conclusion" for item in memories)
     await db.run(tenant, str(run["id"]))
     with psycopg.connect(env["settings"].admin_database_url) as conn:
         count = conn.execute(
@@ -95,19 +97,25 @@ async def test_api_idempotency_isolation_files_and_events(env):
         assert (await client.get(path, headers=other)).status_code == 404
     assert (await client.post(f"/research-runs/{run_id}/cancel", headers=other)).status_code == 404
     raw = b"# Private constraints\n\nKeep error code ERR_42 exactly."
-    upload = await client.post("/uploads", files={"file": ("same.md", raw, "text/markdown")})
+    upload = await client.post(
+        "/uploads",
+        headers={"Idempotency-Key": str(uuid4())},
+        files={"file": ("same.md", raw, "text/markdown")},
+    )
     assert upload.status_code == 201, upload.text
     sid = upload.json()["upload_id"]
     other_upload = await client.post(
-        "/uploads", files={"file": ("same.md", raw, "text/markdown")}, headers=other
+        "/uploads",
+        files={"file": ("same.md", raw, "text/markdown")},
+        headers={**other, "Idempotency-Key": str(uuid4())},
     )
     assert other_upload.json()["upload_id"] != sid
     assert (await client.get(f"/sources/{sid}", headers=other)).status_code == 404
     assert (await client.get(f"/sources/{sid}/raw", headers=other)).status_code == 404
     assert upload.json()["source"]["raw_key"] != other_upload.json()["source"]["raw_key"]
-    isolated_search = await EvidenceService(
-        env["db"], env["store"], env["tenant"]
-    ).search([other_upload.json()["upload_id"]], "ERR_42", "lexical")
+    isolated_search = await EvidenceService(env["db"], env["store"], env["tenant"]).search(
+        [other_upload.json()["upload_id"]], "ERR_42", "lexical"
+    )
     assert isolated_search["results"] == [] and isolated_search["fallback"] == "index_not_ready"
     with pytest.raises(PermissionError):
         await env["store"].get(env["other"], upload.json()["source"]["raw_key"])
@@ -226,9 +234,7 @@ async def test_hard_budget_delivers_partial_package(env):
 async def test_failed_embedding_build_keeps_lexical_index_and_requeues_new_version(env):
     db, tenant = env["db"], env["tenant"]
     source_id, old_version, new_version = "source-" + str(uuid4()), str(uuid4()), str(uuid4())
-    await db.enqueue_index(
-        tenant, source_id, "parsed-hash", old_version, CHUNKER_VERSION, "gte", "9bbca17"
-    )
+    await db.enqueue_index(tenant, source_id, "parsed-hash", old_version, CHUNKER_VERSION, "gte", "9bbca17")
     await db.save_lexical_chunks(
         tenant,
         source_id,
@@ -252,8 +258,6 @@ async def test_failed_embedding_build_keeps_lexical_index_and_requeues_new_versi
     )
     await db.fail_index(tenant, source_id, old_version, "HTTPStatusError:503")
     assert (await db.usable_index_status(tenant, source_id))["index_version"] == old_version
-    await db.requeue_index(
-        tenant, source_id, "parsed-hash", new_version, CHUNKER_VERSION, "gte", "9bbca17"
-    )
+    await db.requeue_index(tenant, source_id, "parsed-hash", new_version, CHUNKER_VERSION, "gte", "9bbca17")
     assert (await db.index_status(tenant, source_id))["index_version"] == new_version
     assert (await db.usable_index_status(tenant, source_id))["index_version"] == old_version

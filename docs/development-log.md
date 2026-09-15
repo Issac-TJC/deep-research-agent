@@ -185,6 +185,24 @@ README 已补全用途、角色、memory／上下文／harness／workflow、环�
 
 随后修正为让 9k contingency 吸收阶段重试超额，累计阶段门槛 27k / 117k / 141k / 180k，仍为 Writer/Patch 保留 39k。修正后 68 项完整后端测试通过；由于原授权限定一次真实复测，没有擅自创建第二个付费 Run。
 
+## 2026-09-15：运行模式防误用修复
+
+- 现场截图中的瞬时 `SYNTHETIC · Research package` 被确认来自验收期间以 `RESEARCH_MODE=fixture` 重建、但未恢复的共享 Compose 服务；`.env` 与真实 DeepSeek/Tavily 凭据本身配置正确。
+- API 健康契约新增 `research_mode` 与 `live_provider_ready`，值来自当前实际运行的 Service 设置，不从构建机配置推断。
+- Web 工作台新增持续可见的“真实研究模式／合成测试模式”横幅；fixture 明确说明不会调用真实模型或搜索，live 明确说明会产生实际用量。历史合成 Run 继续保留，不伪装成真实报告。
+- API、Worker、Indexer 和 Web 已同步重建为 live；`research doctor` 与 `/health` 均确认真实供应商已配置。未自动发起付费研究任务。
+
+## 2026-09-15：v0.4.0-rc.1 P0/MVP 收口（observed）
+
+- 消息重试原先先写消息再创建 Run，重试可能留下重复消息。修复为一个事务内创建 user message、附件关系、assistant placeholder、Run、事件和幂等响应；同键同载荷回放持久化响应，同键异载荷返回 409。
+- 软删除项目原先仍能通过 conversation、source、run 等子入口读取。所有项目子资源加入 active/visible guard；删除立即取消活动 Run/订阅通知，恢复期为 30 天；`project-cleaner --execute` 删除到期数据库图和无共享来源对象。
+- 摘要原先可能把 pending assistant 前的 user message 当作已闭合内容，且 Run 不消费摘要。新摘要只停在 terminal assistant，按上一摘要增量生成；摘要、项目目标/排除、相关记忆、画像、最近消息和来源版本写入不可变 context snapshot。
+- 搜索原先在数据库尾部整体截断，消息或文件可以饿死其他类型。改为每类独立上限、服务层跨类型交错和分组解释；100k 消息分页直接在 SQL 使用 sequence/index，不再先读取全量数组。
+- 画像公开入口原先允许伪造 inferred 信号。契约只接受 explicit，敏感字段被拒绝，否定保留 180 天抑制期；UI 提供冻结、否定、清空和 JSON 导出。
+- 周报原先只有查询快照和通用研究 Run，没有真实候选链路。新增四个官方元数据连接器、独立重试/披露、canonical 去重、provenance、固定权重评分、反馈、八周排除、证据范围和通知状态；预览获取候选但不污染正式去重窗口。
+- 共享开发 Worker 会抢占故障注入 Run，导致两项恢复测试非确定失败。新增无 Worker 的独立 PostgreSQL/MinIO Compose，完整套件在临时卷中运行并在结束后清理。
+- 原始需求 DOCX 未修改。P1 分支重跑/邮件/外部导出和 P2 团队协作未混入本轮；正式 `v0.4.0` 仍要求连续四周 shadow。
+
 ### 预算收口绕过 Writer 的系统性缺陷（2026-09-14）
 
 用户 Run `f4e6862f-abb8-475f-b0e4-720edf52b44c` 在 111,951 token、21 次模型调用和 30 次工具调用后以 `budget:retrieval_calls` 结束，报告为 `revision 999`。账本显示只有 Researcher／Source Analyst 产出，Reviewer／Writer 均未调用；4 个计划任务只完成前 2 个，方法任务先触发 `soft_target:research_extraction`，其依赖的实验任务随后仍被启动。3 次 retrieval 均在新来源语义索引尚未 ready 时降级为 lexical；索引最终在 Run 结束后才 ready，Embedding 服务本身没有 503。
@@ -194,3 +212,18 @@ README 已补全用途、角色、memory／上下文／harness／workflow、环�
 修复后，Researcher 使用 Run 级 retrieval 余量；配额耗尽或并发竞争只关闭 retrieval 并继续读取已授权来源。研究阶段模型预算耗尽会记录 `research.budget_exhausted`，取消未启动及依赖失败任务，并沿图进入 Review → Writer；预算收口禁止新增 gap 和 patch。Reviewer 额度不足时把精确 span claim 标为 provisional 并记录 `review.degraded`；Writer 额度不足时生成按交付任务组织的确定性阶段报告，不再输出任意 claim 列表。发布保留原始 budget stop reason，failed/cancelled task 均使质量保持 `needs_review`。Worker 最外层兜底也复用相同结构化阶段报告。
 
 新增回归覆盖研究预算收口、依赖任务取消、retrieval 配额降级、Reviewer provisional 审查和 Writer 确定性报告。隔离常驻 Worker 后，完整后端与基础设施套件为 72 passed（26.38 秒）；静态检查与 diff 检查通过。此次没有发起新的付费 Run。
+
+## 2026-09-15：候选记忆确认后的 404 修复
+
+- 记忆 `PATCH` 实际已成功，404 来自随后刷新工作区时请求 `/notifications`；Web 后端代理白名单遗漏了 `notifications`，因此把有效的后端接口拦截为 `404: Not found`。
+- 代理已放行通知接口，并保留项目、会话、订阅、周报等 v0.4.0 增量资源及 `PATCH`/`DELETE` 方法支持。
+- 新增浏览器回归，覆盖创建候选记忆、点击“确认”、完整刷新和无错误提示；部署后的独立用例 1 passed，且未调用模型或搜索服务。
+
+## 2026-09-15：EvoMemory v2 一次性切换
+
+- 迁移 `0008` 为现有 Conversation 记录 `memory_cutover_sequence`；旧摘要、记忆和 Profile 标记 v1 legacy，只读可见但不进入 v2 上下文。消息仍是唯一事实源，LangGraph PostgreSQL Conversation checkpoint 是带 tenant/project guard 的可重建缓存。
+- `MemoryBroker` 以 prompt 20%、最低 2k、最高 24k 的硬预算装配最近六轮、累计语义摘要、confirmed 项目知识、confirmed Observation 与 active Profile。SQL 使用精确/全文/向量 rank 的 RRF；快照只保存实际注入项的 ID、hash、分数、摘要版本和汇总 omission 原因。
+- 新增四类 Profile、三类 Observation、global/project scope、证据指针及 complements/contradicts/supersedes 关系。文本修改创建新版本并 supersede；自动产物一律 candidate，拒绝项不参与上下文。
+- `memory_jobs` 持久队列处理 turn/run 蒸馏、手动/自动压缩、关系判断和 embedding 回填。任务按 source digest 幂等，最多三次尝试后 dead-letter；独立辅助模型有 8k/2k token 和 $0.05 单任务上限，费用落入 job usage 与 audit。
+- 同一 Conversation 增加 queued/running single-flight。Research Agent 新增 `search_memory` / `read_memory`，候选只可按需精读，且提示明确禁止以记忆替代原始来源证据。
+- 隔离 PostgreSQL/MinIO 套件 87 passed（最终复跑 21.30 秒）；Ruff、compileall、TypeScript、Next.js 生产构建、正式/测试 Compose 配置和 `git diff --check` 通过。本轮未调用真实记忆模型，因此尚未声称 Recall@5 或 40 轮真实语义质量门槛达标。

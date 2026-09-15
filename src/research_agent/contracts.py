@@ -6,8 +6,9 @@ from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any, Literal
 from uuid import uuid4
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AnyHttpUrl, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 def uid() -> str:
@@ -61,6 +62,7 @@ class ResearchBrief(Contract):
     upload_ids: list[str] = Field(default_factory=list, max_length=20)
     language: Literal["zh", "en"] = "zh"
     as_of: str | None = None
+    memory_context: dict[str, Any] = Field(default_factory=dict)
     version: int = 1
 
 
@@ -108,7 +110,9 @@ class ResearchIntent(Contract):
             raise ValueError("research intent has invalid stage dependency")
         visited: set[ResearchStage] = set()
         while len(visited) < len(known):
-            ready = {stage for stage, deps in dependencies.items() if stage not in visited and deps <= visited}
+            ready = {
+                stage for stage, deps in dependencies.items() if stage not in visited and deps <= visited
+            }
             if not ready:
                 raise ValueError("research intent stage dependency cycle")
             visited.update(ready)
@@ -159,6 +163,237 @@ class RunProfile(Contract):
 class CreateRun(Contract):
     brief: ResearchBrief
     profile: RunProfile = Field(default_factory=RunProfile)
+    project_id: str | None = None
+    conversation_id: str | None = None
+    trigger_message_id: str | None = None
+    parent_run_id: str | None = None
+    run_kind: Literal["research", "quick_answer", "weekly_digest"] = "research"
+    context_snapshot: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProjectCreate(Contract):
+    name: str = Field(min_length=1, max_length=120)
+    objective: str = Field(default="", max_length=4000)
+    description: str = Field(default="", max_length=6000)
+    language: Literal["zh", "en"] = "zh"
+    timezone: str = Field(default="UTC", min_length=1, max_length=100)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    exclusions: list[str] = Field(default_factory=list, max_length=30)
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str):
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("unknown IANA timezone") from exc
+        return value
+
+
+class ProjectUpdate(Contract):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    objective: str | None = Field(default=None, max_length=4000)
+    description: str | None = Field(default=None, max_length=6000)
+    language: Literal["zh", "en"] | None = None
+    timezone: str | None = Field(default=None, min_length=1, max_length=100)
+    tags: list[str] | None = Field(default=None, max_length=30)
+    exclusions: list[str] | None = Field(default=None, max_length=30)
+    status: Literal["active", "archived"] | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str | None):
+        if value is not None:
+            try:
+                ZoneInfo(value)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError("unknown IANA timezone") from exc
+        return value
+
+
+class ConversationCreate(Contract):
+    title: str = Field(default="新对话", min_length=1, max_length=200)
+    parent_conversation_id: str | None = None
+    fork_message_id: str | None = None
+
+
+class ConversationUpdate(Contract):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    status: Literal["active", "archived"] | None = None
+
+
+class MessageCreate(Contract):
+    content: str = Field(min_length=1, max_length=12000)
+    attachment_ids: list[str] = Field(default_factory=list, max_length=20)
+    start_research: bool = True
+    mode: Literal["quick_answer", "research"] | None = None
+    profile: RunProfile = Field(default_factory=RunProfile)
+    parent_run_id: str | None = None
+
+    @model_validator(mode="after")
+    def normalize_mode(self):
+        selected = self.mode or ("research" if self.start_research else "quick_answer")
+        self.mode = selected
+        self.start_research = selected == "research"
+        return self
+
+
+class ProjectArtifactCreate(Contract):
+    source_version_id: str
+    kind: Literal["file", "url", "report"] = "file"
+    title: str | None = Field(default=None, max_length=500)
+    authors: list[str] = Field(default_factory=list, max_length=50)
+    year: int | None = Field(default=None, ge=0, le=9999)
+    doi: str | None = Field(default=None, max_length=300)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    notes: str = Field(default="", max_length=4000)
+
+
+class ProjectArtifactUpdate(Contract):
+    title: str | None = Field(default=None, min_length=1, max_length=500)
+    authors: list[str] | None = Field(default=None, max_length=50)
+    year: int | None = Field(default=None, ge=0, le=9999)
+    doi: str | None = Field(default=None, max_length=300)
+    tags: list[str] | None = Field(default=None, max_length=30)
+    notes: str | None = Field(default=None, max_length=4000)
+
+
+class ProjectUrlArtifactCreate(Contract):
+    url: AnyHttpUrl
+    title: str | None = Field(default=None, max_length=500)
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    notes: str = Field(default="", max_length=4000)
+
+
+class ProjectSearchRequest(Contract):
+    query: str = Field(min_length=1, max_length=1000)
+    types: list[Literal["artifact", "message", "memory", "claim", "report", "digest"]] = Field(
+        default_factory=list, max_length=6
+    )
+    conversation_id: str | None = None
+    tags: list[str] = Field(default_factory=list, max_length=30)
+    created_after: datetime | None = None
+    created_before: datetime | None = None
+    limit: int = Field(default=20, ge=1, le=100)
+
+
+class MemoryCreate(Contract):
+    type: Literal[
+        "goal", "scope", "constraint", "decision", "preference", "conclusion", "question", "entity", "todo"
+    ]
+    content: str = Field(min_length=1, max_length=6000)
+    status: Literal["candidate", "confirmed"] = "candidate"
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    source_type: Literal["user", "message", "claim", "artifact", "digest"] = "user"
+    source_id: str | None = None
+
+
+class MemoryUpdate(Contract):
+    content: str | None = Field(default=None, min_length=1, max_length=6000)
+    status: Literal["candidate", "confirmed", "rejected", "superseded", "deleted"] | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+    supersedes_id: str | None = None
+    conflicts_with_id: str | None = None
+
+
+class ResearchProfileUpdate(Contract):
+    learning_enabled: bool | None = None
+    preferences: dict[str, Any] | None = None
+
+
+class ProfileSignalCreate(Contract):
+    field: str = Field(min_length=1, max_length=100)
+    value: str = Field(min_length=1, max_length=1000)
+    source: Literal["explicit"] = "explicit"
+    category: Literal["assistant_style", "user_profile", "research_taste", "project_profile"] = (
+        "user_profile"
+    )
+    scope: Literal["user", "project"] = "user"
+    project_id: str | None = None
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    state: Literal["active", "rejected", "frozen"] = "active"
+
+
+class ProfileSignalUpdate(Contract):
+    value: str | None = Field(default=None, min_length=1, max_length=1000)
+    state: Literal["candidate", "active", "rejected", "frozen"] | None = None
+
+
+class ObservationCreate(Contract):
+    memory_type: Literal["semantic", "procedural", "episodic"]
+    scope: Literal["user_global", "project"] = "project"
+    summary: str = Field(min_length=1, max_length=500)
+    body: str = Field(min_length=1, max_length=8000)
+    why_it_matters: str = Field(default="", max_length=2000)
+    status: Literal["candidate", "confirmed"] = "candidate"
+    confidence: float = Field(default=1.0, ge=0, le=1)
+    source_type: Literal["user", "message", "run", "claim", "artifact", "digest"] = "user"
+    source_id: str | None = None
+
+
+class ObservationUpdate(Contract):
+    summary: str | None = Field(default=None, min_length=1, max_length=500)
+    body: str | None = Field(default=None, min_length=1, max_length=8000)
+    why_it_matters: str | None = Field(default=None, max_length=2000)
+    status: Literal["candidate", "confirmed", "rejected", "superseded", "deleted"] | None = None
+    confidence: float | None = Field(default=None, ge=0, le=1)
+
+
+class ConversationCompact(Contract):
+    force: bool = True
+
+
+class SubscriptionCreate(Contract):
+    name: str = Field(default="论文周报", min_length=1, max_length=200)
+    topic: str = Field(min_length=1, max_length=2000)
+    query_terms: list[str] = Field(default_factory=list, max_length=30)
+    exclusions: list[str] = Field(default_factory=list, max_length=30)
+    language: Literal["zh", "en"] = "zh"
+    paper_count: int = Field(default=5, ge=3, le=10)
+    lookback_days: int = Field(default=14, ge=7, le=30)
+    weekday: int = Field(default=0, ge=0, le=6)
+    delivery_time: str = Field(default="09:00", pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    timezone: str = Field(default="UTC", min_length=1, max_length=100)
+    allow_needs_review_delivery: bool = False
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str):
+        try:
+            ZoneInfo(value)
+        except ZoneInfoNotFoundError as exc:
+            raise ValueError("unknown IANA timezone") from exc
+        return value
+
+
+class SubscriptionUpdate(Contract):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    topic: str | None = Field(default=None, min_length=1, max_length=2000)
+    query_terms: list[str] | None = Field(default=None, max_length=30)
+    exclusions: list[str] | None = Field(default=None, max_length=30)
+    language: Literal["zh", "en"] | None = None
+    paper_count: int | None = Field(default=None, ge=3, le=10)
+    lookback_days: int | None = Field(default=None, ge=7, le=30)
+    weekday: int | None = Field(default=None, ge=0, le=6)
+    delivery_time: str | None = Field(default=None, pattern=r"^([01]\d|2[0-3]):[0-5]\d$")
+    timezone: str | None = Field(default=None, min_length=1, max_length=100)
+    status: Literal["active", "paused", "deleted"] | None = None
+    allow_needs_review_delivery: bool | None = None
+
+    @field_validator("timezone")
+    @classmethod
+    def valid_timezone(cls, value: str | None):
+        if value is not None:
+            try:
+                ZoneInfo(value)
+            except ZoneInfoNotFoundError as exc:
+                raise ValueError("unknown IANA timezone") from exc
+        return value
+
+
+class DigestFeedbackCreate(Contract):
+    feedback: Literal["useful", "irrelevant", "read", "saved", "later", "never_recommend"]
+    canonical_paper_id: str | None = None
 
 
 class ResearchTask(Contract):
@@ -223,9 +458,9 @@ class TextBlock(Contract):
     end: int
     page: int | None = None
     bbox: tuple[float, float, float, float] | None = None
-    kind: Literal[
-        "heading", "paragraph", "page", "list", "code", "table", "formula", "figure", "caption"
-    ] = "paragraph"
+    kind: Literal["heading", "paragraph", "page", "list", "code", "table", "formula", "figure", "caption"] = (
+        "paragraph"
+    )
     section_path: list[str] = Field(default_factory=list)
     extraction_method: Literal["native", "ocr", "layout", "formula_recognition", "vision"] = "native"
     confidence: float | None = Field(default=None, ge=0, le=1)

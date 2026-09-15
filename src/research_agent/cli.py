@@ -2,8 +2,10 @@ import asyncio
 import hashlib
 import json
 import secrets
+from datetime import datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 import typer
@@ -79,6 +81,87 @@ def indexer(once: bool = False):
     from research_agent.indexer import work
 
     asyncio.run(work(settings(), once))
+
+
+@app.command("digest-scheduler")
+def digest_scheduler(once: bool = False, poll_seconds: int = 60):
+    """Queue due weekly subscriptions; idempotency prevents duplicate runs for a period."""
+    if poll_seconds < 10:
+        raise typer.BadParameter("poll-seconds must be at least 10")
+
+    async def run():
+        s = settings()
+        db, store = Database(s), ObjectStore(s)
+        await db.open()
+        await store.setup()
+        try:
+            while True:
+                async with await psycopg.AsyncConnection.connect(s.admin_database_url) as admin:
+                    admin.row_factory = psycopg.rows.dict_row
+                    subscriptions = await (
+                        await admin.execute(
+                            """SELECT s.tenant_id,s.id,s.schedule FROM research_subscriptions s
+                            JOIN projects p ON p.id=s.project_id
+                            WHERE s.status='active' AND p.status='active'"""
+                        )
+                    ).fetchall()
+                queued = 0
+                for subscription in subscriptions:
+                    schedule = subscription["schedule"]
+                    try:
+                        local = datetime.now(ZoneInfo(schedule.get("timezone", "UTC")))
+                    except ZoneInfoNotFoundError:
+                        local = datetime.now(ZoneInfo("UTC"))
+                    weekday = int(schedule.get("weekday", 0))
+                    hour, minute = (int(part) for part in schedule.get("delivery_time", "09:00").split(":"))
+                    if local.weekday() < weekday or (
+                        local.weekday() == weekday and (local.hour, local.minute) < (hour, minute)
+                    ):
+                        continue
+                    try:
+                        result = await ResearchService(db, store).run_subscription(
+                            str(subscription["tenant_id"]), str(subscription["id"])
+                        )
+                        queued += int(result["created"])
+                    except Exception as exc:
+                        typer.echo(f"Digest {subscription['id']} failed to queue: {str(exc)[:200]}")
+                typer.echo(f"Digest scheduler checked {len(subscriptions)} subscriptions; queued {queued}")
+                if once:
+                    return
+                await asyncio.sleep(poll_seconds)
+        finally:
+            await db.close()
+
+    asyncio.run(run())
+
+
+@app.command("project-cleaner")
+def project_cleaner(
+    execute: bool = typer.Option(False, "--execute", help="Permanently delete expired projects"),
+):
+    """Purge project rows and unshared objects after the 30-day recovery window."""
+    if not execute:
+        raise typer.BadParameter("Pass --execute to confirm permanent cleanup")
+
+    async def run():
+        s = settings()
+        db, store = Database(s), ObjectStore(s)
+        await db.open()
+        await store.setup()
+        deleted = []
+        try:
+            async with await psycopg.AsyncConnection.connect(s.admin_database_url) as admin:
+                tenants = await (await admin.execute("SELECT id FROM tenants ORDER BY id")).fetchall()
+            for (tenant_id,) in tenants:
+                for project in await db.purge_expired_projects(str(tenant_id)):
+                    for key in project.pop("object_keys"):
+                        await store.delete(str(tenant_id), key)
+                    deleted.append(project)
+        finally:
+            await db.close()
+        typer.echo(json.dumps({"purged": deleted, "count": len(deleted)}, ensure_ascii=False))
+
+    asyncio.run(run())
 
 
 @app.command()
@@ -222,6 +305,7 @@ def freeze(
 def doctor():
     """Read-only environment checks; does not make paid provider calls."""
     s = settings()
+    memory_ready = s.research_mode == "fixture" or bool(s.memory_api_key and s.memory_model)
     typer.echo(
         json.dumps(
             {
@@ -229,12 +313,16 @@ def doctor():
                 "deepseek_key_configured": bool(s.deepseek_api_key),
                 "tavily_key_configured": bool(s.tavily_api_key),
                 "model": s.deepseek_model,
+                "memory_model": s.memory_model,
+                "memory_provider_ready": memory_ready,
                 "python_environment": str(Path(__import__("sys").prefix)),
                 "live_campaign_cap_usd": s.live_campaign_usd,
             },
             indent=2,
         )
     )
+    if not memory_ready:
+        raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

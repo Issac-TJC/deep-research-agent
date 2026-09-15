@@ -3,6 +3,7 @@ import logging
 
 from research_agent.db import BudgetExceeded, Database, StaleLease
 from research_agent.graph import ResearchEngine
+from research_agent.memory import MemoryJobRunner
 from research_agent.providers import ProviderError
 from research_agent.settings import Settings
 from research_agent.storage import ObjectStore
@@ -91,10 +92,16 @@ async def work(settings: Settings, once=False):
             claim = await db.claim()
             if claim:
                 await execute_claim(db, store, claim)
-            elif once:
-                break
             else:
-                await asyncio.sleep(1)
+                memory_claim = await db.claim_memory_job()
+                if memory_claim:
+                    await MemoryJobRunner(db).execute(
+                        memory_claim["tenant"], memory_claim["job_id"]
+                    )
+                elif once:
+                    break
+                else:
+                    await asyncio.sleep(1)
             if once:
                 break
     finally:

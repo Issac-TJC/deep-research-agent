@@ -10,6 +10,8 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor, SpanExporter, SpanExportResult
 
+from research_agent import __version__
+
 _configured = False
 
 
@@ -42,7 +44,9 @@ def configure():
     if _configured:
         return
     provider = TracerProvider(
-        resource=Resource.create({"service.name": "deep-research-agent", "service.version": "0.2.0"})
+        resource=Resource.create(
+            {"service.name": "deep-research-agent", "service.version": __version__}
+        )
     )
     if path := os.getenv("RESEARCH_TRACE_FILE"):
         provider.add_span_processor(SimpleSpanProcessor(MetadataExporter(path)))

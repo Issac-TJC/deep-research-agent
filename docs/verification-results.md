@@ -1,5 +1,53 @@
 # V1 验证记录
 
+## EvoMemory v2（2026-09-15）工程验收
+
+| 验证 | 实际结果与范围 |
+|---|---|
+| 独立完整后端 | `make integration-isolated`：**87 passed，21.30 秒**；全新 PostgreSQL/MinIO，迁移到 `0008` 后自动清理 |
+| 记忆边界 | 覆盖 v1 legacy 不注入、candidate 不注入、confirmed 注入、用户全局/项目 scope、双租户 RLS、证据指针与 supersede 关系 |
+| 会话状态 | 覆盖 pending 协议不进入摘要、最近六轮保留、Conversation checkpoint 可更新/恢复、同对话 queued/running 返回 409 |
+| 后台队列 | 覆盖 digest 幂等基础、任务领取/完成、Observation embedding/linking 入口和 job API；fixture 不调用付费辅助模型 |
+| 静态与前端 | Ruff、compileall、TypeScript、Next.js production build、两个 Compose config、`git diff --check` 均通过 |
+
+未执行真实辅助模型的 40 轮长对话、中文/英文 Recall@5、纠正事实使用率和关系判断质量评测，因此这些产品验收阈值仍是待测项，而不是已通过指标。
+
+## v0.4.0-rc.1（2026-09-15）P0/MVP 验收
+
+本轮以只读 PRD `Deep Research Agent 项目化研究与智能周报产品需求文档.docx` 为需求基线，完成 P0/MVP；P1 分支重跑、邮件、外部导出与 P2 团队协作不在本 RC 范围。正式 `v0.4.0` 仍须完成连续四周 shadow，RC 验收不能替代长期质量结论。
+
+| 验证 | 命令／方式 | 实际结果与范围 |
+|---|---|---|
+| 独立完整后端 | `make integration-isolated` | **86 passed，21.55 秒**；独立 PostgreSQL/MinIO、无常驻 Worker 抢占，结束后自动清理测试卷 |
+| 迁移前进／回滚 | `.venv/bin/alembic downgrade 0006`、`.venv/bin/alembic upgrade head`、`.venv/bin/alembic current` | 通过，最终为 `0007 (head)`；历史数据结构采用增量迁移 |
+| Python 静态与编译 | `.venv/bin/ruff check src migrations tests scripts`、`.venv/bin/python -m compileall -q ...` | 通过 |
+| Web 类型与生产构建 | `pnpm --dir apps/web typecheck`、`pnpm --dir apps/web build` | 通过；Next.js 生产构建与 TypeScript 通过 |
+| Chrome 端到端 | `pnpm --dir apps/web exec playwright test` | **4 passed，9.2 秒**；研究/证据/导出、移动端双 PDF 分别定位、项目记忆/真实候选周报、键盘焦点与控件可访问名称 |
+| Compose 与运行健康 | `docker compose config -q`、`docker compose up -d --build ...`、`GET /health` | 构建/启动通过；健康检查返回 `version=0.4.0-rc.1` |
+| 容量性能 | `make performance` | 回滚式生成 1000 项目、1000 会话、10000 资产、100000 消息、5000 记忆；P95：项目列表 2.539ms、会话列表 0.772ms、消息页 0.797ms、记忆检索 0.795ms，均通过门禁 |
+| 免费学术接口 smoke | `.venv/bin/python scripts/smoke_academic.py --query "3D Gaussian Splatting" --days 30` | 9 个候选；OpenAlex/Crossref/PubMed 各成功 3 个，arXiv 429 被隔离并披露；partial-success 通过，付费模型调用为 0 |
+| 差异卫生 | `git diff --check` | 通过 |
+
+在线 smoke 的观测耗时为 OpenAlex 503ms、Crossref 1166ms、PubMed 845ms、arXiv 4516ms；成功、失败、尝试次数、延迟和平台成本字段均进入连接器审计。OpenAlex 的审计估算成本字段为 `$0.001`，这是平台成本建模字段，不是本轮发生的付费模型调用。
+
+已覆盖的主要回归包括：消息幂等及异载荷 409、项目删除全入口 404/恢复/到期清理、摘要不越 pending 且真正注入冻结上下文、同项目记忆关系、画像来源权限与 180 天否定、跨类型搜索公平性、DST 周期、重复调度与单通知、连接器部分失败、canonical/provenance/评分/反馈、abstract-only 证据边界、SSE `Last-Event-ID` 重连，以及周报固定阶段预算快照。
+
+尚未宣称完成：连续四周 shadow、人工论文相关性/事实支持率、完整 WCAG 2.1 AA 人工审计、生产 SLA，以及 P1/P2 功能。shadow 期间要逐周核对调度准时性、候选覆盖、八周去重、证据范围、人工相关性、失败披露、成本和重复通知；全部通过后才能升为 `v0.4.0`。
+
+## v0.3.0（2026-09-15）项目化研究与智能周报
+
+本轮以产品需求文档为需求来源，把原有单次 Run 工作台改造成 `Project → Conversation → Message → Research Run` 持续研究工作区。迁移把历史 Run 放入各租户默认项目，并为新增用户自动创建默认项目与对话；原 `/research-runs` 接口保留兼容。
+
+| 验证 | 命令／方式 | 实际结果与范围 |
+|---|---|---|
+| 完整后端 | `RUN_INTEGRATION=1 .venv/bin/pytest -q` | 75 passed；真实 PostgreSQL／MinIO，模型和搜索为 fixture／故障注入 |
+| 项目化定向集成 | `RUN_INTEGRATION=1 .venv/bin/pytest -q tests/test_project_workspace.py` | 3 passed；项目、会话、资产、记忆、画像、搜索、RLS、软删除、周报入队与质量门禁 |
+| 前端类型与生产构建 | `pnpm --dir apps/web run typecheck`、`pnpm --dir apps/web run build` | 通过；Next.js v0.3 工作台生产构建成功 |
+| Chrome 端到端 | `pnpm --dir apps/web exec playwright test` | 3 passed，11.9 秒；保留原研究/PDF 移动端旅程，新增项目记忆与周报完整旅程 |
+| 静态／配置 | `.venv/bin/ruff check ...`、`docker compose config -q`、`git diff --check` | 通过 |
+
+周报试运行不会访问外部论文平台。正式入队复用现有受控 `web_search` 研究链，并在报告 `quality_status=passed` 时发布站内通知；fixture 报告为 `unchecked`，因此按设计进入 `needs_review` 而不推送。OpenAlex/Crossref 当前只作为计划连接器记录，直接 API 连接尚未实现。可选 `automation` Compose profile 提供按时区/星期扫描的幂等排程器。本轮没有调用付费模型，也未执行人工论文质量评审。
+
 验证日期：2026-09-11。分支：`research-blueprint-v1`。以下区分真实基础设施测试、合成研究流程、真实供应商联调和尚未执行的质量实验。这里的“通过”不代表已有企业客户、生产 SLA、论文实验复现或人工事实认证。
 
 ## 环境与版本
@@ -71,7 +119,7 @@
 - 10 个保留 briefs 的真实付费质量评测、每例多次重复、完整 B0／B1／B2 以及上下文／并发消融；工具与数据已交付，实验尚未执行。
 - 人工 citation precision、事实支持率、论文解释准确性、研究建议可操作性和评审者一致性；相应指标保持 null。
 - 长期运行中的上下文省略概率、质量／成本收益、生产 SLA、跨机器性能和相对参考项目的优越性。
-- 任意复杂 PDF、OCR、论文代码执行、自动跨 run 语义记忆、SSO、源 ACL 撤销、未知费用自动对账。
+- 任意复杂 PDF、OCR、论文代码执行、真实模型下跨 Run 记忆质量验收、SSO、源 ACL 撤销、未知费用自动对账。
 
 因此，简历可描述实际实现和测试范围，可引用带 run/profile/样本条件的调用与耗时；不能写“多 Agent 准确率提升 X%”“无损压缩”“已复现论文”或“生产级合规平台”。
 

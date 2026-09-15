@@ -82,10 +82,15 @@ class FixtureProvider:
             if has_read:
                 message["content"] = "Source read; ready to extract evidence."
             elif fetched or existing:
+                task_text = " ".join(
+                    str(payload.get("task", {}).get(field, ""))
+                    for field in ("objective", "query")
+                ).lower()
+                source_index = 1 if len(existing) > 1 and "semantic" in task_text else 0
                 name, args = (
                     "read_source",
                     {
-                        "source_id": fetched["source_id"] if fetched else existing[0],
+                        "source_id": fetched["source_id"] if fetched else existing[source_index],
                         "start": 0,
                         "length": 6000,
                     },

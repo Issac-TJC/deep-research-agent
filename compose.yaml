@@ -16,6 +16,15 @@ x-app-env: &app-env
   DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-flash}
   DEEPSEEK_THINKING: ${DEEPSEEK_THINKING:-enabled}
   DEEPSEEK_EFFORT: ${DEEPSEEK_EFFORT:-low}
+  MEMORY_API_KEY: ${MEMORY_API_KEY:-}
+  MEMORY_BASE_URL: ${MEMORY_BASE_URL:-https://api.deepseek.com}
+  MEMORY_MODEL: ${MEMORY_MODEL:-}
+  MEMORY_INPUT_USD_PER_MILLION: ${MEMORY_INPUT_USD_PER_MILLION:-0.30}
+  MEMORY_OUTPUT_USD_PER_MILLION: ${MEMORY_OUTPUT_USD_PER_MILLION:-1.20}
+  MEMORY_JOB_MAX_INPUT_TOKENS: ${MEMORY_JOB_MAX_INPUT_TOKENS:-8000}
+  MEMORY_JOB_MAX_OUTPUT_TOKENS: ${MEMORY_JOB_MAX_OUTPUT_TOKENS:-2000}
+  MEMORY_JOB_MAX_USD: ${MEMORY_JOB_MAX_USD:-0.05}
+  MEMORY_CHECKPOINT_KEEP: ${MEMORY_CHECKPOINT_KEEP:-1000}
   TAVILY_API_KEY: ${TAVILY_API_KEY:-}
   LIVE_CAMPAIGN_USD: ${LIVE_CAMPAIGN_USD:-10}
   MODEL_INPUT_USD_PER_MILLION: ${MODEL_INPUT_USD_PER_MILLION:-0.30}
@@ -109,6 +118,19 @@ services:
     build: {context: ., dockerfile: infra/docker/Dockerfile}
     command: research worker
     environment: *app-env
+    networks: [default, parse, models]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      minio: {condition: service_started}
+      parser: {condition: service_started}
+      embedding: {condition: service_healthy}
+  digest-scheduler:
+    profiles: [automation]
+    build: {context: ., dockerfile: infra/docker/Dockerfile}
+    command: research digest-scheduler
+    environment:
+      <<: *app-env
+      ADMIN_DATABASE_URL: postgresql://postgres:postgres_local@postgres:5432/research
     networks: [default, parse, models]
     depends_on:
       migrate: {condition: service_completed_successfully}

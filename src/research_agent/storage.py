@@ -51,3 +51,8 @@ class ObjectStore:
                 response["Body"].close()
 
         return await asyncio.to_thread(read)
+
+    async def delete(self, tenant: str, key: str) -> None:
+        if not key.startswith(tenant + "/") or ".." in key:
+            raise PermissionError("object outside tenant namespace")
+        await asyncio.to_thread(self.client.delete_object, Bucket=self.bucket, Key=key)

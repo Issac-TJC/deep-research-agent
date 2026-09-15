@@ -76,11 +76,26 @@ class SearchSourcesArgs(BaseModel):
     limit: int = Field(default=8, ge=1, le=12)
 
 
+class SearchMemoryArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    query: str = Field(min_length=2, max_length=1000)
+    include_candidates: bool = True
+    limit: int = Field(default=6, ge=1, le=10)
+
+
+class ReadMemoryArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    object_type: str = Field(pattern="^(project_memory|observation)$")
+    object_id: str
+
+
 TOOL_MODELS = {
     "search": SearchArgs,
     "fetch": FetchArgs,
     "search_sources": SearchSourcesArgs,
     "read_source": ReadArgs,
+    "search_memory": SearchMemoryArgs,
+    "read_memory": ReadMemoryArgs,
 }
 TOOLS = [
     {
@@ -103,6 +118,16 @@ TOOLS = [
             "read_source",
             ReadArgs,
             "Read a bounded range of an authorized original source; follow up to read more.",
+        ),
+        (
+            "search_memory",
+            SearchMemoryArgs,
+            "Search confirmed and candidate governed memories. Results are leads, not claim evidence.",
+        ),
+        (
+            "read_memory",
+            ReadMemoryArgs,
+            "Read one governed memory with status and evidence pointers before using it.",
         ),
     ]
 ]
@@ -175,6 +200,7 @@ class ResearchEngine:
     def __init__(self, db: Database, store: ObjectStore, tenant: str, run: dict, fence: int):
         self.db, self.store, self.tenant = db, store, tenant
         self.run_id, self.fence = str(run["id"]), fence
+        self.project_id = str(run["project_id"]) if run.get("project_id") else None
         self.brief = ResearchBrief.model_validate(run["brief"])
         self.profile = RunProfile.model_validate(run["profile"])
         self.mode = run["mode"]
@@ -335,7 +361,9 @@ class ResearchEngine:
                         }
                         for source in sources
                     ],
-                    "available_capabilities": ["search", "fetch", "read_source"],
+                    "available_capabilities": [
+                        "search", "fetch", "read_source", "search_memory", "read_memory"
+                    ],
                     "instructions": (
                         "Infer the user's research intent instead of asking them to choose a template. Select only the paper "
                         "modules the user wants as role=deliverable. Add hidden role=supporting modules when a deliverable"
@@ -533,6 +561,8 @@ class ResearchEngine:
                     "instructions": "Choose search/fetch/read iteratively. Read original evidence and limitations."
                     " Fetch promising search results and read them before searching again; summaries are not evidence."
                     " For every retrieval hit you use, call read_source around its start/end before extraction."
+                    " Use search_memory/read_memory only for governed prior context; candidate memories are unconfirmed"
+                    " and no memory substitutes for a cited original source."
                     " Stop with a short final message when sufficient; extraction runs next. Never spawn agents. "
                     + STAGE_AGENT_INSTRUCTIONS[task.stage],
                     "dependency_context": state.get("dependency_context", {}),
@@ -621,6 +651,25 @@ class ResearchEngine:
                             args.limit,
                             0 if self.mode == "fixture" else self.db.settings.index_wait_seconds,
                         )
+                    if name == "search_memory":
+                        if not self.project_id:
+                            raise ValueError("memory_requires_project")
+                        return {
+                            "results": await self.db.search_memory(
+                                self.tenant, self.project_id, args.query,
+                                args.include_candidates, args.limit,
+                            ),
+                            "instruction": (
+                                "Memory is planning context, not report evidence. Read selected items; "
+                                "candidate status means user confirmation is still pending."
+                            ),
+                        }
+                    if name == "read_memory":
+                        if not self.project_id:
+                            raise ValueError("memory_requires_project")
+                        return await self.db.read_memory(
+                            self.tenant, self.project_id, args.object_type, args.object_id
+                        )
                     if args.source_id not in sources:
                         raise ValueError("source_not_authorized_for_task")
                     _, doc = await self.evidence.document(args.source_id)
@@ -652,6 +701,8 @@ class ResearchEngine:
                     result = await self.gateway.tool(
                         "retrieve"
                         if name == "search_sources"
+                        else "memory"
+                        if name in {"search_memory", "read_memory"}
                         else name
                         if name in TOOL_MODELS
                         else "invalid_tool",
@@ -659,7 +710,7 @@ class ResearchEngine:
                         operation,
                         task.id,
                     )
-                    if "source_id" in result:
+                    if "source_id" in result and name in {"fetch", "read_source"}:
                         sources.add(result["source_id"])
                     if "results" in result:
                         candidates.update(r["url"] for r in result["results"] if r.get("url"))
